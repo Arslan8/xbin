@@ -85,7 +85,7 @@ def cleanup_stale_plugins():
 # ==========================================
 # MULTI-ANALYSIS BLACKBOARD API
 # ==========================================
-app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.6.0")
+app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.7.0")
 
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
@@ -93,7 +93,13 @@ if not os.path.exists(UPLOAD_DIR):
 @app.get("/api/v1/system/logs")
 def get_system_logs():
     logs = r.lrange("xbin:syslogs", 0, -1)
-    return {"logs": "\\n".join(reversed(logs))}
+    return {"logs": "\n".join(reversed(logs))}
+
+@app.post("/api/v1/session/clear")
+def clear_session():
+    r.flushdb()
+    sys_log("Session cleared.")
+    return {"status": "success"}
 
 @app.get("/api/v1/health")
 def get_health():
@@ -115,7 +121,7 @@ async def upload_binary(file: UploadFile = File(...), requested_analyses: str = 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     analyses = [a.strip() for a in requested_analyses.split(",") if a.strip()]
-    sys_log(f"Upload: {file.filename}")
+    sys_log(f"Upload: {file.filename} (Goals: {analyses})")
     r.publish("xbin:events", json.dumps({"type": "NEW_BINARY", "filename": file.filename, "path": f"/app/uploads/{file.filename}", "requested_analyses": analyses}))
     return {"status": "success"}
 
@@ -189,11 +195,6 @@ def get_analysis_results(analysis_type: str):
     keys = r.keys(f"xbin:bb:{analysis_type}:*")
     return {"analysis_type": analysis_type, "results": {k.split(":")[-1]: json.loads(r.get(k)) for k in keys}}
 
-@app.get("/api/v1/blackboard/{analysis_type}/{item_key}")
-def get_item_state(analysis_type: str, item_key: str):
-    if not (s := r.get(f"xbin:bb:{analysis_type}:{item_key}")): raise HTTPException(status_code=404)
-    return json.loads(s)
-
 @app.get("/api/v1/blackboard/{analysis_type}/{item_key}/consensus")
 def get_consensus(analysis_type: str, item_key: str):
     state_str = r.get(f"xbin:bb:{analysis_type}:{item_key}")
@@ -214,9 +215,17 @@ def get_consensus(analysis_type: str, item_key: str):
 
 @app.get("/api/v1/blackboard/{analysis_type}/audit")
 def get_blackboard_audit(analysis_type: str):
-    """Returns the historical audit trail for a specific blackboard category."""
-    logs = r.lrange(f"xbin:bb_logs:{analysis_type}", 0, -1)
-    return {"logs": "\\n".join(reversed(logs))}
+    print(f"[*] Audit API called for {analysis_type}")
+    cat = analysis_type.strip()
+    audit_key = f"xbin:bb_logs:{cat}"
+    sys_log(f"Retrieving audit logs from {audit_key}...")
+    logs = r.lrange(audit_key, 0, -1)
+    if not logs:
+        sys_log(f"No audit logs found for {cat}")
+        return {"logs": "No history recorded yet."}
+    content = "\n".join(logs)
+    sys_log(f"Returning {len(logs)} audit entries.")
+    return {"logs": content}
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -224,7 +233,7 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>xbin | Consensus Visualizer</title>
+        <title>xbin | Intelligent Analysis Dashboard</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
         <style>
             :root { --bg: #0b0f1a; --card: #161e2e; --text: #f3f4f6; --accent: #3b82f6; --danger: #ef4444; --success: #10b981; --warning: #f59e0b; --muted: #6b7280; --border: #2d3748; }
@@ -265,10 +274,10 @@ def dashboard():
             .logo-orb { position: relative; width: 30px; height: 30px; }
             .logo-ripple { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--accent); border-radius: 6px; z-index: 1; animation: logo-ripple 2s infinite; }
             .logo-x { position: relative; z-index: 2; background: var(--accent); width: 30px; height: 30px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 900; box-shadow: 0 0 15px rgba(59, 130, 246, 0.5); }
-            </style>
-            </head>
-            <body>
-            <header>
+        </style>
+    </head>
+    <body>
+        <header>
             <div style="display: flex; align-items: center; gap: 1rem;">
                 <div class="logo-orb">
                     <div class="logo-ripple"></div>
@@ -276,10 +285,9 @@ def dashboard():
                 </div>
                 <h1 style="margin: 0; font-size: 1.1rem;">xbin <span style="font-weight: 300; color: var(--muted);">Blackboard</span></h1>
             </div>
-
             <div style="display: flex; gap: 1rem; align-items: center;">
                 <button class="btn" style="background: #2d3748;" onclick="showSystemLogs()">System Logs</button>
-                <button class="btn btn-danger btn-action" onclick="bulkAction('stop')">Stop Fleet</button>
+                <button class="btn btn-danger btn-action" onclick="clearSession()">Clear Session</button>
                 <button class="btn btn-primary btn-action" onclick="bulkAction('start')">Start Fleet</button>
                 <div id="orc-health" class="badge badge-running">Orchestrator: OK</div>
             </div>
@@ -289,7 +297,7 @@ def dashboard():
                 <div class="card">
                     <h2>Deploy Analysis</h2>
                     <input type="file" id="f" style="display:none" onchange="document.getElementById('fl').innerText=this.files[0].name">
-                    <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Choose Binary</span></button>
+                    <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Binary</span></button>
                     <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.4rem;">
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="symbol_matching" checked> Symbols</label>
@@ -325,6 +333,12 @@ def dashboard():
                 fd.append('requested_analyses', goals.join(','));
                 await fetch('/api/v1/upload', {method:'POST', body:fd}); toast('Binary Announced');
             }
+            async function clearSession() {
+                if(confirm('Clear all data?')) {
+                    await fetch('/api/v1/session/clear', {method:'POST'});
+                    location.reload();
+                }
+            }
             async function toggle(n,c,s) { const action=s==='RUNNING'?'stop':'start'; await fetch(`/api/v1/plugins/${n}/${action}?category=${c}`, {method:'POST'}); refresh(); }
             async function bulkAction(a, category = null) {
                 const res=await fetch('/api/v1/plugins/available'); const data=await res.json();
@@ -357,105 +371,57 @@ def dashboard():
                 fetch('/api/v1/system/logs').then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs);
             }
             function showBlackboardLogs(cat) {
+                console.log("Fetching audit for " + cat);
                 document.getElementById('modal-title').innerText=`Audit Trail: ${cat}`;
                 document.getElementById('cy-container').style.display='none';
                 document.getElementById('modal-legend').innerHTML = '';
                 document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
-                fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs || 'No entries yet.');
+                fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>{
+                    console.log("Received audit logs", d);
+                    document.getElementById('modal-content').innerText=d.logs || 'No entries yet.';
+                });
             }
             async function showConsensus(cat, item) {
-                const modal = document.getElementById('modal');
-                const overlay = document.getElementById('overlay');
-                const title = document.getElementById('modal-title');
-                const content = document.getElementById('modal-content');
-                const cyContainer = document.getElementById('cy-container');
-                const legend = document.getElementById('modal-legend');
-
-                title.innerText = `Consensus CFG: ${item}`;
-                content.style.display = 'none';
-                legend.innerHTML = '';
-                cyContainer.style.display = 'block';
-                cyContainer.innerHTML = '<div style="color:var(--muted); padding:2rem;">Initialising engine...</div>';
-                
-                overlay.style.display = 'block';
-                modal.style.display = 'flex';
-
+                const modal = document.getElementById('modal'); const overlay = document.getElementById('overlay');
+                const title = document.getElementById('modal-title'); const content = document.getElementById('modal-content');
+                const cyContainer = document.getElementById('cy-container'); const legend = document.getElementById('modal-legend');
+                title.innerText = `Consensus CFG: ${item}`; content.style.display = 'none'; legend.innerHTML = '';
+                cyContainer.style.display = 'block'; cyContainer.innerHTML = '<div style="color:var(--muted); padding:2rem;">Initialising engine...</div>';
+                overlay.style.display = 'block'; modal.style.display = 'flex';
                 try {
-                    console.log(`[*] Fetching consensus for ${cat}/${item}...`);
-                    const res = await fetch(`/api/v1/blackboard/${cat}/${item}/consensus`);
-                    if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                    const res = await fetch(`/api/v1/blackboard/${cat}/${encodeURIComponent(item)}/consensus`);
                     const data = await res.json();
-                    
-                    if (!data.nodes || Object.keys(data.nodes).length === 0) {
-                        cyContainer.innerHTML = '<div style="color:var(--danger); padding:2rem;">No graph data found in consensus.</div>';
-                        return;
-                    }
-
+                    if (!data.nodes || Object.keys(data.nodes).length === 0) { cyContainer.innerHTML = '<div style="color:var(--danger); padding:2rem;">No data.</div>'; return; }
                     const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
-                    const backendColors = {}; let colorIdx = 0;
-                    const elements = [];
-
+                    const backendColors = {}; let colorIdx = 0; const elements = [];
                     for(let id in data.nodes) {
                         const node = data.nodes[id];
-                        const avgConf = node.vouches.reduce((a, b) => a + b.confidence, 0) / node.vouches.length;
+                        const avgConf = node.vouches.reduce((a, b) => a + (b.confidence || 0), 0) / node.vouches.length;
                         const nodeData = { id: id, label: `${node.label}\\nConf: ${Math.round(avgConf*100)}%`, avgConf: avgConf };
-                        
                         node.vouches.forEach((v, i) => {
                             if (!backendColors[v.backend]) backendColors[v.backend] = colors[colorIdx++ % colors.length];
-                            if (i < 16) { // Cytoscape limit
-                                nodeData[`pie${i+1}val`] = 100 / node.vouches.length;
-                                nodeData[`pie${i+1}col`] = backendColors[v.backend];
-                            }
+                            if (i < 6) { nodeData[`pie${i+1}val`] = 100 / node.vouches.length; nodeData[`pie${i+1}col`] = backendColors[v.backend]; }
                         });
+                        for(let j=node.vouches.length+1; j<=6; j++) { nodeData[`pie${j}val`] = 0; nodeData[`pie${j}col`] = 'transparent'; }
                         elements.push({ data: nodeData });
                     }
-
-                    legend.innerHTML = Object.keys(backendColors).map(b => `
-                        <div style="display:flex; align-items:center; gap:0.3rem;">
-                            <div style="width:10px; height:10px; border-radius:2px; background:${backendColors[b]}"></div>
-                            <span>${b}</span>
-                        </div>
-                    `).join('');
-
+                    legend.innerHTML = Object.keys(backendColors).map(b => `<div style="display:flex; align-items:center; gap:0.3rem;"><div style="width:10px; height:10px; border-radius:2px; background:${backendColors[b]}"></div><span>${b}</span></div>`).join('');
                     for(let id in data.edges) {
                         const edge = data.edges[id];
-                        const avgConf = edge.vouches.reduce((a, b) => a + b.confidence, 0) / edge.vouches.length;
+                        const avgConf = edge.vouches.reduce((a, b) => a + (b.confidence || 0), 0) / edge.vouches.length;
                         elements.push({ data: { id: id, source: edge.source, target: edge.target, avgConf: avgConf } });
                     }
-
-                    console.log(`[*] Rendering ${elements.length} elements...`);
-                    cyContainer.innerHTML = ''; // Clear "initialising" message
-                    
-                    const cy = cytoscape({
-                        container: cyContainer,
-                        elements: elements,
+                    cyContainer.innerHTML = '';
+                    cytoscape({
+                        container: cyContainer, elements: elements,
                         style: [
-                            { 
-                                selector: 'node', 
-                                style: { 
-                                    'background-color': '#2d3748', 'label': 'data(label)', 'color': '#fff', 
-                                    'font-size': '10px', 'text-wrap': 'wrap', 'text-valign': 'center',
-                                    'width': (n) => 50 + (n.data('avgConf') * 40),
-                                    'height': (n) => 50 + (n.data('avgConf') * 40),
-                                    'pie-size': '100%',
-                                    'pie-1-background-size': 'data(pie1val)', 'pie-1-background-color': 'data(pie1col)',
-                                    'pie-2-background-size': 'data(pie2val)', 'pie-2-background-color': 'data(pie2col)',
-                                    'pie-3-background-size': 'data(pie3val)', 'pie-3-background-color': 'data(pie3col)',
-                                    'pie-4-background-size': 'data(pie4val)', 'pie-4-background-color': 'data(pie4col)',
-                                    'pie-5-background-size': 'data(pie5val)', 'pie-5-background-color': 'data(pie5col)',
-                                    'pie-6-background-size': 'data(pie6val)', 'pie-6-background-color': 'data(pie6col)'
-                                } 
-                            },
-                            { selector: 'edge', style: { 'width': (e) => 2 + (e.data('avgConf') * 8), 'line-color': '#4a5568', 'target-arrow-color': '#4a5568', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'opacity': 0.8 } }
+                            { selector: 'node', style: { 'background-color': '#2d3748', 'label': 'data(label)', 'color': '#fff', 'font-size': '8px', 'text-wrap': 'wrap', 'text-valign': 'center', 'width': (n) => 40 + (n.data('avgConf') * 30), 'height': (n) => 40 + (n.data('avgConf') * 30), 'pie-size': '100%', 'pie-1-background-size': 'data(pie1val)', 'pie-1-background-color': 'data(pie1col)', 'pie-2-background-size': 'data(pie2val)', 'pie-2-background-color': 'data(pie2col)', 'pie-3-background-size': 'data(pie3val)', 'pie-3-background-color': 'data(pie3col)', 'pie-4-background-size': 'data(pie4val)', 'pie-4-background-color': 'data(pie4col)', 'pie-5-background-size': 'data(pie5val)', 'pie-5-background-color': 'data(pie5col)', 'pie-6-background-size': 'data(pie6val)', 'pie-6-background-color': 'data(pie6col)' } },
+                            { selector: 'edge', style: { 'width': (e) => 1 + (e.data('avgConf') * 6), 'line-color': '#4a5568', 'target-arrow-color': '#4a5568', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'opacity': 0.7 } }
                         ],
-                        layout: { name: 'cose', animate: false, padding: 30 }
+                        layout: { name: 'cose', animate: false }
                     });
-
-                } catch (e) {
-                    console.error(e);
-                    cyContainer.innerHTML = `<div style="color:var(--danger); padding:2rem;">Failed to render graph: ${e.message}<br><br>Check console for details.</div>`;
-                }
+                } catch (e) { cyContainer.innerHTML = `<div style="color:var(--danger); padding:2rem;">Error: ${e.message}</div>`; }
             }
             function copyLogs() { navigator.clipboard.writeText(document.getElementById('modal-content').innerText); toast('Copied!'); }
             function closeModal() { document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
@@ -512,16 +478,27 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         return orchestrator_pb2.HeartbeatResponse(acknowledged=True)
 
     def PostResult(self, request, context):
-        bb_key = f"xbin:bb:{request.analysis_type}:{request.item_key}"
+        # Clean and verify category
+        cat = request.analysis_type.strip()
+        bb_key = f"xbin:bb:{cat}:{request.item_key}"
         weight = BACKEND_WEIGHTS.get(request.backend_name, 0.50)
         
         # Record Audit Log for this Category
         timestamp = time.strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {request.backend_name} posted result for {request.item_key} (Conf: {request.confidence})"
-        r.lpush(f"xbin:bb_logs:{request.analysis_type}", log_entry)
-        r.ltrim(f"xbin:bb_logs:{request.analysis_type}", 0, 100)
+        log_entry = f"[{timestamp}] {request.backend_name} -> {request.item_key} (Conf: {request.confidence})"
+        
+        # Use a more explicit log key
+        audit_key = f"xbin:bb_logs:{cat}"
+        r.lpush(audit_key, log_entry)
+        r.ltrim(audit_key, 0, 100)
+        sys_log(f"Audit entry added to {audit_key}")
 
-        new_hyp = {"data": json.loads(request.result_data), "score": round(request.confidence * weight, 3), "backend": request.backend_name}
+        new_hyp = {
+            "data": json.loads(request.result_data), 
+            "score": round(request.confidence * weight, 3), 
+            "raw_conf": round(request.confidence, 3),
+            "backend": request.backend_name
+        }
         state = json.loads(r.get(bb_key)) if r.exists(bb_key) else {"status": "PENDING", "hypotheses": []}
         state["hypotheses"].append(new_hyp); state["hypotheses"] = sorted(state["hypotheses"], key=lambda x: x["score"], reverse=True)
         status = "RESOLVED"
@@ -534,7 +511,10 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         return orchestrator_pb2.PostResultResponse(accepted=True, current_status=status)
 
 def main():
-    ensure_redis(); cleanup_stale_plugins(); r.flushdb()
+    ensure_redis()
+    r.flushdb() # Clean slate for the new session
+    cleanup_stale_plugins()
+    
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     orchestrator_pb2_grpc.add_OrchestratorServiceServicer_to_server(XbinOrchestratorServicer(), server)
     server.add_insecure_port(GRPC_PORT); server.start()
