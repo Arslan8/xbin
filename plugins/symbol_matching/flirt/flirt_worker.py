@@ -2,6 +2,9 @@ import xbin
 import flirt
 import os
 
+# FLIRT Signature database matcher
+# This plugin reacts to new binaries and scans them using IDA FLIRT signatures
+
 @xbin.plugin(name="flirt_matcher", category="symbol_matching")
 class FlirtWorker:
     def __init__(self):
@@ -20,25 +23,33 @@ class FlirtWorker:
                     except: pass
         print(f"[*] Loaded {len(self.matchers)} FLIRT signature files.")
 
-    def on_new_binary(self, binary_path: str):
+    def on_new_binary(self, binary_path: str, requested_goals: list):
+        """Called when a new binary is announced on the blackboard."""
+        if "symbol_matching" not in requested_goals:
+            print(f"[*] Symbol matching not requested for {os.path.basename(binary_path)}. Skipping.")
+            return
+
         print(f"[*] FLIRT analyzing new binary: {binary_path}")
-        if not os.path.exists(binary_path): return
+        if not os.path.exists(binary_path):
+            print(f"[-] Binary not found at {binary_path}")
+            return
+
         with open(binary_path, "rb") as f:
             data = f.read()
 
-        # FLIRT matching
         from xbin.sdk import _current_worker
         for matcher in self.matchers:
             matches = matcher.match(data)
             for match in matches:
-                # Post the symbol name as the data
+                # Post result using standardized post_result method
                 _current_worker.post_result(item_key="0x400000", data=str(match), confidence=1.0)
+                print(f"[+] Posted FLIRT match: {match}")
 
-    def on_update(self, category, item_key, top_hypothesis):
-        # We can listen to other analyses!
-        # e.g. if we get a CFG update, we might refine our search
-        if category == "cfg_generation":
-            print(f"[*] CFG update received for {item_key}. Flirt might use this...")
+    def on_update(self, category, item_key, new_hypothesis, top_hypothesis):
+        """Called when any tool updates the blackboard."""
+        if top_hypothesis['score'] >= 1.0:
+            # If someone else already found a perfect match, we could stop
+            pass
 
 if __name__ == "__main__":
     xbin.start_worker()

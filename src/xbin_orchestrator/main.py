@@ -9,7 +9,7 @@ import hashlib
 
 import grpc
 import redis
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse
 import uvicorn
 
@@ -110,7 +110,7 @@ def get_health():
     return {"orchestrator": "HEALTHY", "worker_fleet": workers}
 
 @app.post("/api/v1/upload")
-async def upload_binary(file: UploadFile = File(...), requested_analyses: str = ""):
+async def upload_binary(file: UploadFile = File(...), requested_analyses: str = Form("")):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -168,7 +168,7 @@ def bg_start_plugin(name: str, category: str):
         set_plugin_state(name, "STARTING")
         subprocess.run(["docker", "rm", "-f", container_name], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         abs_uploads = os.path.abspath(UPLOAD_DIR)
-        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", image_name]
+        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1", image_name]
         subprocess.run(run_cmd, check=True, stdout=subprocess.DEVNULL)
     except Exception as e:
         sys_log(f"Fail {name}: {e}"); set_plugin_state(name, "ERROR", error=str(e))
@@ -189,34 +189,34 @@ def get_analysis_results(analysis_type: str):
     keys = r.keys(f"xbin:bb:{analysis_type}:*")
     return {"analysis_type": analysis_type, "results": {k.split(":")[-1]: json.loads(r.get(k)) for k in keys}}
 
+@app.get("/api/v1/blackboard/{analysis_type}/{item_key}")
+def get_item_state(analysis_type: str, item_key: str):
+    if not (s := r.get(f"xbin:bb:{analysis_type}:{item_key}")): raise HTTPException(status_code=404)
+    return json.loads(s)
+
 @app.get("/api/v1/blackboard/{analysis_type}/{item_key}/consensus")
 def get_consensus(analysis_type: str, item_key: str):
-    """Aggregates all tool reports into a single graph with vouch counts."""
     state_str = r.get(f"xbin:bb:{analysis_type}:{item_key}")
     if not state_str: raise HTTPException(status_code=404)
-    
     state = json.loads(state_str)
     consensus = {"nodes": {}, "edges": {}}
-    
     for hyp in state["hypotheses"]:
-        backend = hyp["backend"]
-        data = hyp["data"]
-        
+        backend = hyp["backend"]; confidence = hyp.get("raw_conf", 1.0); data = hyp["data"]
         for node in data.get("nodes", []):
             nid = node["id"]
-            if nid not in consensus["nodes"]:
-                consensus["nodes"][nid] = {"label": node.get("label", nid), "vouches": []}
-            if backend not in consensus["nodes"][nid]["vouches"]:
-                consensus["nodes"][nid]["vouches"].append(backend)
-            
+            if nid not in consensus["nodes"]: consensus["nodes"][nid] = {"label": node.get("label", nid), "vouches": []}
+            consensus["nodes"][nid]["vouches"].append({"backend": backend, "confidence": confidence})
         for edge in data.get("edges", []):
             eid = f"{edge['source']}->{edge['target']}"
-            if eid not in consensus["edges"]:
-                consensus["edges"][eid] = {"source": edge["source"], "target": edge["target"], "vouches": []}
-            if backend not in consensus["edges"][eid]["vouches"]:
-                consensus["edges"][eid]["vouches"].append(backend)
-            
+            if eid not in consensus["edges"]: consensus["edges"][eid] = {"source": edge["source"], "target": edge["target"], "vouches": []}
+            consensus["edges"][eid]["vouches"].append({"backend": backend, "confidence": confidence})
     return consensus
+
+@app.get("/api/v1/blackboard/{analysis_type}/audit")
+def get_blackboard_audit(analysis_type: str):
+    """Returns the historical audit trail for a specific blackboard category."""
+    logs = r.lrange(f"xbin:bb_logs:{analysis_type}", 0, -1)
+    return {"logs": "\\n".join(reversed(logs))}
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -229,43 +229,54 @@ def dashboard():
         <style>
             :root { --bg: #0b0f1a; --card: #161e2e; --text: #f3f4f6; --accent: #3b82f6; --danger: #ef4444; --success: #10b981; --warning: #f59e0b; --muted: #6b7280; --border: #2d3748; }
             body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-            header { background: var(--card); padding: 1rem 2rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+            header { background: var(--card); padding: 1rem 2rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
             .main-layout { display: grid; grid-template-columns: 340px 1fr; flex: 1; overflow: hidden; }
             .sidebar { border-right: 1px solid var(--border); padding: 1.5rem; overflow-y: auto; background: rgba(22, 30, 46, 0.5); }
-            .content { padding: 2rem; overflow-y: auto; }
+            .content { padding: 2rem; overflow-y: auto; position: relative; }
             .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; }
-            .btn { border: none; padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.8rem; display: flex; align-items: center; gap: 0.5rem; transition: all 0.2s; }
-            .btn:active { transform: scale(0.95); }
+            .btn { border: none; padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.8rem; display: flex; align-items: center; gap: 0.5rem; transition: all 0.2s ease; }
+            .btn:active { transform: scale(0.92); }
             .btn-primary { background: var(--accent); color: white; }
-            .btn-danger { background: rgba(239, 68, 68, 0.1); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.1); }
+            .btn-danger { background: rgba(239, 68, 68, 0.1); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.2); }
             .btn-action { padding: 0.3rem 0.6rem; font-size: 0.7rem; }
-            .plugin-item { padding: 1rem; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 0.75rem; background: rgba(0,0,0,0.2); position: relative; overflow: hidden; }
-            .heartbeat-ping { position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: var(--success); opacity: 0; }
-            .ping-active { animation: pulse-ping 0.8s ease-out; }
-            @keyframes pulse-ping { 0% { opacity: 1; } 100% { opacity: 0; } }
+            .plugin-item { padding: 1rem; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 0.75rem; background: rgba(0,0,0,0.3); position: relative; overflow: hidden; }
+            .heartbeat-ping { position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: var(--success); opacity: 0; pointer-events: none; }
+            @keyframes pulse-ping { 0% { opacity: 0; } 10% { opacity: 1; box-shadow: 0 0 15px var(--success); } 100% { opacity: 0; } }
+            .ping-active { animation: pulse-ping 1.2s ease-out; }
             .badge { padding: 0.2rem 0.5rem; border-radius: 99px; font-size: 0.6rem; font-weight: 800; text-transform: uppercase; }
             .badge-running { background: rgba(16, 185, 129, 0.1); color: var(--success); }
             .badge-wait { background: rgba(245, 158, 11, 0.1); color: var(--warning); animation: blink 1.5s infinite; }
-            .badge-error { background: rgba(239, 68, 68, 0.1); color: var(--danger); }
             @keyframes blink { 50% { opacity: 0.5; } }
             table { width: 100%; border-collapse: collapse; }
             th { text-align: left; padding: 0.8rem; color: var(--muted); font-size: 0.7rem; text-transform: uppercase; border-bottom: 1px solid var(--border); }
             td { padding: 0.8rem; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
-            #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; display: none; }
-            #modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90vw; height: 85vh; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 2rem; z-index: 1100; display: none; flex-direction: column; }
-            .log-box { flex: 1; background: #070a13; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.75rem; color: #a0aec0; overflow-y: auto; border: 1px solid var(--border); white-space: pre-wrap; }
-            #cy-container { flex: 1; background: #070a13; border-radius: 8px; border: 1px solid var(--border); margin-top: 1rem; }
+            #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 900; display: none; backdrop-filter: blur(4px); }
+            #modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 85vw; height: 80vh; background: var(--card); border: 1px solid var(--accent); border-radius: 16px; padding: 2rem; z-index: 1000; display: none; flex-direction: column; box-shadow: 0 0 40px rgba(0,0,0,0.8); }
+            .log-box { flex: 1; background: #070a13; padding: 1.5rem; border-radius: 8px; font-family: monospace; font-size: 0.75rem; color: #cbd5e1; overflow-y: auto; border: 1px solid var(--border); white-space: pre-wrap; }
+            #cy-container { flex: 1; background: #070a13; border-radius: 8px; border: 1px solid var(--border); margin-top: 1rem; width: 100%; height: 100%; }
             .toast-container { position: fixed; bottom: 2rem; right: 2rem; z-index: 2000; }
             .toast { background: var(--card); border: 1px solid var(--accent); padding: 1rem; border-radius: 8px; box-shadow: 0 10px 20px rgba(0,0,0,0.5); margin-top: 0.5rem; animation: slideIn 0.3s ease; }
             @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
-        </style>
-    </head>
-    <body>
-        <header>
+
+            @keyframes logo-ripple { 
+                0% { transform: scale(1); opacity: 0.8; }
+                100% { transform: scale(2.5); opacity: 0; }
+            }
+            .logo-orb { position: relative; width: 30px; height: 30px; }
+            .logo-ripple { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--accent); border-radius: 6px; z-index: 1; animation: logo-ripple 2s infinite; }
+            .logo-x { position: relative; z-index: 2; background: var(--accent); width: 30px; height: 30px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 900; box-shadow: 0 0 15px rgba(59, 130, 246, 0.5); }
+            </style>
+            </head>
+            <body>
+            <header>
             <div style="display: flex; align-items: center; gap: 1rem;">
-                <div style="background: var(--accent); width: 30px; height: 30px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 900;">X</div>
+                <div class="logo-orb">
+                    <div class="logo-ripple"></div>
+                    <div class="logo-x">X</div>
+                </div>
                 <h1 style="margin: 0; font-size: 1.1rem;">xbin <span style="font-weight: 300; color: var(--muted);">Blackboard</span></h1>
             </div>
+
             <div style="display: flex; gap: 1rem; align-items: center;">
                 <button class="btn" style="background: #2d3748;" onclick="showSystemLogs()">System Logs</button>
                 <button class="btn btn-danger btn-action" onclick="bulkAction('stop')">Stop Fleet</button>
@@ -273,13 +284,12 @@ def dashboard():
                 <div id="orc-health" class="badge badge-running">Orchestrator: OK</div>
             </div>
         </header>
-
         <div class="main-layout">
             <aside class="sidebar">
                 <div class="card">
                     <h2>Deploy Analysis</h2>
                     <input type="file" id="f" style="display:none" onchange="document.getElementById('fl').innerText=this.files[0].name">
-                    <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Binary</span></button>
+                    <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Choose Binary</span></button>
                     <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.4rem;">
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="symbol_matching" checked> Symbols</label>
@@ -292,11 +302,11 @@ def dashboard():
             </aside>
             <main class="content" id="bb-content"></main>
         </div>
-
         <div id="overlay" onclick="closeModal()"></div>
         <div id="modal">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
                 <h3 id="modal-title" style="margin:0; color:var(--accent);">Result</h3>
+                <div id="modal-legend" style="display:flex; gap:1rem; font-size:0.7rem; color:var(--muted);"></div>
                 <div style="display:flex; gap:0.5rem;">
                     <button class="btn btn-primary btn-action" onclick="copyLogs()">📋 Copy</button>
                     <button onclick="closeModal()" class="btn btn-danger btn-action">Close</button>
@@ -305,9 +315,7 @@ def dashboard():
             <div id="modal-content" class="log-box"></div>
             <div id="cy-container" style="display:none"></div>
         </div>
-
         <div class="toast-container" id="toasts"></div>
-
         <script>
             let lastHeartbeats = {};
             function toast(m) { const t=document.createElement('div'); t.className='toast'; t.innerText=m; document.getElementById('toasts').appendChild(t); setTimeout(()=>t.remove(),3000); }
@@ -318,12 +326,18 @@ def dashboard():
                 await fetch('/api/v1/upload', {method:'POST', body:fd}); toast('Binary Announced');
             }
             async function toggle(n,c,s) { const action=s==='RUNNING'?'stop':'start'; await fetch(`/api/v1/plugins/${n}/${action}?category=${c}`, {method:'POST'}); refresh(); }
-            async function bulkAction(a, c=null) {
+            async function bulkAction(a, category = null) {
                 const res=await fetch('/api/v1/plugins/available'); const data=await res.json();
-                data.plugins.forEach(p => {
-                    if (c && p.category !== c) return;
-                    if (a==='start' && !['RUNNING','BUILDING','STARTING'].includes(p.status)) fetch(`/api/v1/plugins/${p.name}/start?category=${p.category}`, {method:'POST'});
-                    if (a==='stop' && p.status==='RUNNING') fetch(`/api/v1/plugins/${p.name}/stop`, {method:'POST'});
+                const targets = data.plugins.filter(p => {
+                    if (category && p.category !== category) return false;
+                    if (a === 'start') return !['RUNNING', 'BUILDING', 'STARTING'].includes(p.status);
+                    if (a === 'stop') return p.status === 'RUNNING';
+                    return false;
+                });
+                toast(`${a==='start'?'Deploying':'Stopping'} ${targets.length} plugins...`);
+                targets.forEach(p => {
+                    const url = a === 'start' ? `/api/v1/plugins/${p.name}/start?category=${p.category}` : `/api/v1/plugins/${p.name}/stop`;
+                    fetch(url, {method:'POST'});
                 });
             }
             async function showLogs(n) {
@@ -331,79 +345,149 @@ def dashboard():
                 document.getElementById('cy-container').style.display='none';
                 document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
-                const res=await fetch(`/api/v1/plugins/${n}/logs`); const d=await res.json();
-                document.getElementById('modal-content').innerText=d.logs;
+                const res = await fetch(`/api/v1/plugins/${n}/logs`); const d = await res.json();
+                document.getElementById('modal-content').innerText = d.logs || 'No output.';
             }
             function showSystemLogs() {
                 document.getElementById('modal-title').innerText='System Logs';
                 document.getElementById('cy-container').style.display='none';
+                document.getElementById('modal-legend').innerHTML = '';
                 document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
                 fetch('/api/v1/system/logs').then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs);
             }
-            async function showConsensus(cat, item) {
-                document.getElementById('modal-title').innerText=`Consensus CFG: ${item}`;
-                document.getElementById('modal-content').style.display='none';
-                document.getElementById('cy-container').style.display='block';
+            function showBlackboardLogs(cat) {
+                document.getElementById('modal-title').innerText=`Audit Trail: ${cat}`;
+                document.getElementById('cy-container').style.display='none';
+                document.getElementById('modal-legend').innerHTML = '';
+                document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
-                
-                const res = await fetch(`/api/v1/blackboard/${cat}/${item}/consensus`);
-                const data = await res.json();
-                
-                const elements = [];
-                for(let id in data.nodes) {
-                    const node = data.nodes[id];
-                    elements.push({ data: { id: id, label: `${node.label}\\n[${node.vouches.length} vouches]`, vouches: node.vouches.length } });
-                }
-                for(let id in data.edges) {
-                    const edge = data.edges[id];
-                    elements.push({ data: { id: id, source: edge.source, target: edge.target, vouches: edge.vouches.length } });
-                }
+                fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs || 'No entries yet.');
+            }
+            async function showConsensus(cat, item) {
+                const modal = document.getElementById('modal');
+                const overlay = document.getElementById('overlay');
+                const title = document.getElementById('modal-title');
+                const content = document.getElementById('modal-content');
+                const cyContainer = document.getElementById('cy-container');
+                const legend = document.getElementById('modal-legend');
 
-                setTimeout(() => {
-                    cytoscape({
-                        container: document.getElementById('cy-container'),
+                title.innerText = `Consensus CFG: ${item}`;
+                content.style.display = 'none';
+                legend.innerHTML = '';
+                cyContainer.style.display = 'block';
+                cyContainer.innerHTML = '<div style="color:var(--muted); padding:2rem;">Initialising engine...</div>';
+                
+                overlay.style.display = 'block';
+                modal.style.display = 'flex';
+
+                try {
+                    console.log(`[*] Fetching consensus for ${cat}/${item}...`);
+                    const res = await fetch(`/api/v1/blackboard/${cat}/${item}/consensus`);
+                    if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                    const data = await res.json();
+                    
+                    if (!data.nodes || Object.keys(data.nodes).length === 0) {
+                        cyContainer.innerHTML = '<div style="color:var(--danger); padding:2rem;">No graph data found in consensus.</div>';
+                        return;
+                    }
+
+                    const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
+                    const backendColors = {}; let colorIdx = 0;
+                    const elements = [];
+
+                    for(let id in data.nodes) {
+                        const node = data.nodes[id];
+                        const avgConf = node.vouches.reduce((a, b) => a + b.confidence, 0) / node.vouches.length;
+                        const nodeData = { id: id, label: `${node.label}\\nConf: ${Math.round(avgConf*100)}%`, avgConf: avgConf };
+                        
+                        node.vouches.forEach((v, i) => {
+                            if (!backendColors[v.backend]) backendColors[v.backend] = colors[colorIdx++ % colors.length];
+                            if (i < 16) { // Cytoscape limit
+                                nodeData[`pie${i+1}val`] = 100 / node.vouches.length;
+                                nodeData[`pie${i+1}col`] = backendColors[v.backend];
+                            }
+                        });
+                        elements.push({ data: nodeData });
+                    }
+
+                    legend.innerHTML = Object.keys(backendColors).map(b => `
+                        <div style="display:flex; align-items:center; gap:0.3rem;">
+                            <div style="width:10px; height:10px; border-radius:2px; background:${backendColors[b]}"></div>
+                            <span>${b}</span>
+                        </div>
+                    `).join('');
+
+                    for(let id in data.edges) {
+                        const edge = data.edges[id];
+                        const avgConf = edge.vouches.reduce((a, b) => a + b.confidence, 0) / edge.vouches.length;
+                        elements.push({ data: { id: id, source: edge.source, target: edge.target, avgConf: avgConf } });
+                    }
+
+                    console.log(`[*] Rendering ${elements.length} elements...`);
+                    cyContainer.innerHTML = ''; // Clear "initialising" message
+                    
+                    const cy = cytoscape({
+                        container: cyContainer,
                         elements: elements,
                         style: [
-                            { selector: 'node', style: { 'background-color': '#3b82f6', 'label': 'data(label)', 'color': '#fff', 'font-size': '8px', 'text-wrap': 'wrap', 'width': (n) => 20 + n.data('vouches')*10 } },
-                            { selector: 'edge', style: { 'width': (e) => e.data('vouches')*2, 'line-color': '#4a5568', 'target-arrow-color': '#4a5568', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } }
+                            { 
+                                selector: 'node', 
+                                style: { 
+                                    'background-color': '#2d3748', 'label': 'data(label)', 'color': '#fff', 
+                                    'font-size': '10px', 'text-wrap': 'wrap', 'text-valign': 'center',
+                                    'width': (n) => 50 + (n.data('avgConf') * 40),
+                                    'height': (n) => 50 + (n.data('avgConf') * 40),
+                                    'pie-size': '100%',
+                                    'pie-1-background-size': 'data(pie1val)', 'pie-1-background-color': 'data(pie1col)',
+                                    'pie-2-background-size': 'data(pie2val)', 'pie-2-background-color': 'data(pie2col)',
+                                    'pie-3-background-size': 'data(pie3val)', 'pie-3-background-color': 'data(pie3col)',
+                                    'pie-4-background-size': 'data(pie4val)', 'pie-4-background-color': 'data(pie4col)',
+                                    'pie-5-background-size': 'data(pie5val)', 'pie-5-background-color': 'data(pie5col)',
+                                    'pie-6-background-size': 'data(pie6val)', 'pie-6-background-color': 'data(pie6col)'
+                                } 
+                            },
+                            { selector: 'edge', style: { 'width': (e) => 2 + (e.data('avgConf') * 8), 'line-color': '#4a5568', 'target-arrow-color': '#4a5568', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'opacity': 0.8 } }
                         ],
-                        layout: { name: 'cose' }
+                        layout: { name: 'cose', animate: false, padding: 30 }
                     });
-                }, 200);
+
+                } catch (e) {
+                    console.error(e);
+                    cyContainer.innerHTML = `<div style="color:var(--danger); padding:2rem;">Failed to render graph: ${e.message}<br><br>Check console for details.</div>`;
+                }
             }
             function copyLogs() { navigator.clipboard.writeText(document.getElementById('modal-content').innerText); toast('Copied!'); }
             function closeModal() { document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
             async function refresh() {
                 try {
-                    const pRes=await fetch('/api/v1/plugins/available'); const pData=await pRes.json();
-                    const cats={}; pData.plugins.forEach(p => { if(!cats[p.category]) cats[p.category]=[]; cats[p.category].push(p); });
-                    let html='';
+                    const pRes = await fetch('/api/v1/plugins/available'); const pData = await pRes.json();
+                    const pluginList = document.getElementById('plugin-list');
+                    const cats = {}; pData.plugins.forEach(p => { if(!cats[p.category]) cats[p.category]=[]; cats[p.category].push(p); });
+                    let html = '';
                     for(let cat in cats) {
-                        html += `<div style="display:flex; justify-content:space-between; margin:1.5rem 0 0.5rem;"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase;">${cat}</div><div style="display:flex; gap:0.2rem"><button class="btn btn-action" onclick="bulkAction('stop','${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start','${cat}')">Start</button></div></div>`;
+                        html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:1.5rem 0 0.5rem;"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; font-weight:700;">${cat.replace('_',' ')}</div><div style="display:flex; gap:0.25rem"><button class="btn btn-action" onclick="bulkAction('stop', '${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start', '${cat}')">Start</button></div></div>`;
                         cats[cat].forEach(p => {
-                            if(p.last_beat > (lastHeartbeats[p.name] || 0)) {
-                                lastHeartbeats[p.name]=p.last_beat;
-                                const el=document.getElementById(`beat-${p.name}`);
-                                if(el) { el.classList.remove('ping-active'); void el.offsetWidth; el.classList.add('ping-active'); }
-                            }
-                            html += `<div class="plugin-item"><div id="beat-${p.name}" class="heartbeat-ping"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem">● READY</span>':''}</div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}')">Logs</button></div></div></div>`;
+                            const isNewBeat = p.last_beat > (lastHeartbeats[p.name] || 0);
+                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div></div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
+                            if (isNewBeat) lastHeartbeats[p.name] = p.last_beat;
                         });
                     }
-                    document.getElementById('plugin-list').innerHTML=html;
-                    const bb=document.getElementById('bb-content'); bb.innerHTML='';
-                    for(let cat of ['symbol_matching', 'cfg_generation']) {
-                        const res=await fetch(`/api/v1/blackboard/${cat}`); const d=await res.json();
-                        if(Object.keys(d.results).length>0) {
-                            let table=`<div class="card"><h2>${cat.replace('_',' ')}</h2><table><tr><th>Target</th><th>Result</th><th>Action</th></tr>`;
-                            for(let k in d.results) {
-                                const item = d.results[k];
-                                table+=`<tr><td style="font-family:monospace">${k}</td><td style="color:var(--accent)">Top Hypothesis by ${item.hypotheses[0].backend}</td><td>${cat==='cfg_generation'?'<button class="btn btn-primary btn-action" onclick="showConsensus(\\''+cat+'\\',\\''+k+'\\')">View Consensus Graph</button>':''}</td></tr>`;
-                            }
-                            bb.innerHTML += table+'</table></div>';
+                    if (pluginList.innerHTML !== html) pluginList.innerHTML = html;
+                    const bb = document.getElementById('bb-content');
+                    const categories = [...new Set([...pData.plugins.map(p => p.category), 'symbol_matching', 'cfg_generation'])];
+                    for (let cat of categories) {
+                        const res = await fetch(`/api/v1/blackboard/${cat}`); const d = await res.json();
+                        let catId = `bb-section-${cat}`; let section = document.getElementById(catId);
+                        if (Object.keys(d.results).length > 0) {
+                            if (!section) { section = document.createElement('div'); section.id = catId; section.className = 'card'; bb.appendChild(section); }
+                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><h2>${cat.replace('_',' ')}</h2><button class="btn btn-action" style="background:#2d3748" onclick="showBlackboardLogs('${cat}')">Audit Trail</button></div><table><thead><tr><th>Target</th><th>Result</th><th>Action</th></tr></thead><tbody>`;
+                            for(let k in d.results) { const item = d.results[k]; tableHtml += `<tr class="bb-row"><td><code>${k}</code></td><td style="color:var(--accent); font-weight:500;">Hypothesis by ${item.hypotheses[0].backend}</td><td>${cat==='cfg_generation'?'<button class="btn btn-primary btn-action" onclick="showConsensus(\\''+cat+'\\',\\''+k+'\\')">Visual Graph</button>':''}</td></tr>`; }
+                            tableHtml += '</tbody></table>';
+                            if (section.innerHTML !== tableHtml) { section.innerHTML = tableHtml; section.style.animation = 'glow-pulse 0.5s ease-out'; }
                         }
                     }
-                } catch(e) {}
+                } catch(e) { }
             }
             setInterval(refresh, 2000); refresh();
         </script>
@@ -430,6 +514,13 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
     def PostResult(self, request, context):
         bb_key = f"xbin:bb:{request.analysis_type}:{request.item_key}"
         weight = BACKEND_WEIGHTS.get(request.backend_name, 0.50)
+        
+        # Record Audit Log for this Category
+        timestamp = time.strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {request.backend_name} posted result for {request.item_key} (Conf: {request.confidence})"
+        r.lpush(f"xbin:bb_logs:{request.analysis_type}", log_entry)
+        r.ltrim(f"xbin:bb_logs:{request.analysis_type}", 0, 100)
+
         new_hyp = {"data": json.loads(request.result_data), "score": round(request.confidence * weight, 3), "backend": request.backend_name}
         state = json.loads(r.get(bb_key)) if r.exists(bb_key) else {"status": "PENDING", "hypotheses": []}
         state["hypotheses"].append(new_hyp); state["hypotheses"] = sorted(state["hypotheses"], key=lambda x: x["score"], reverse=True)
@@ -439,7 +530,7 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
                 status = "CONFLICTED"
         state["status"] = status; r.set(bb_key, json.dumps(state))
         sys_log(f"Update [{request.analysis_type}]: {request.item_key}")
-        r.publish("xbin:events", json.dumps({"type": "BLACKBOARD_UPDATE", "analysis_type": request.analysis_type, "item_key": request.item_key, "top_hypothesis": state["hypotheses"][0], "status": status}))
+        r.publish("xbin:events", json.dumps({"type": "BLACKBOARD_UPDATE", "analysis_type": request.analysis_type, "item_key": request.item_key, "new_hypothesis": new_hyp, "top_hypothesis": state["hypotheses"][0], "status": status}))
         return orchestrator_pb2.PostResultResponse(accepted=True, current_status=status)
 
 def main():
