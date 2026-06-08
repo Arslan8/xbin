@@ -33,6 +33,8 @@ BACKEND_WEIGHTS = {
     "exact_hasher": 1.0,
     "agentic_arbiter": 1.0,
     "flirt_matcher": 1.0,
+    "angr_boundaries": 1.0,
+    "radare_boundaries": 0.85,
     "semantic_llm": 0.85,
     "structural_cfg": 0.70
 }
@@ -56,15 +58,12 @@ def ensure_redis():
     try:
         r.ping()
     except redis.ConnectionError:
-        if os.path.exists("/.dockerenv") or REDIS_HOST != "localhost":
-            exit(1)
+        if os.path.exists("/.dockerenv") or REDIS_HOST != "localhost": exit(1)
         try:
             check = subprocess.run(["docker", "ps", "-a", "--filter", "name=xbin-redis", "--format", "{{.Names}}"], capture_output=True, text=True)
             if "xbin-redis" in check.stdout:
-                sys_log("Restarting Redis...")
                 subprocess.run(["docker", "start", "xbin-redis"], check=True, stdout=subprocess.DEVNULL)
             else:
-                sys_log("Booting Redis...")
                 subprocess.run(["docker", "run", "-d", "--name", "xbin-redis", "-p", "6379:6379", "redis:alpine"], check=True, stdout=subprocess.DEVNULL)
             for _ in range(10):
                 try:
@@ -85,10 +84,12 @@ def cleanup_stale_plugins():
 # ==========================================
 # MULTI-ANALYSIS BLACKBOARD API
 # ==========================================
-app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.7.0")
+app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.8.0")
 
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+if not os.path.exists(UPLOAD_DIR): os.makedirs(UPLOAD_DIR)
+
+def get_container_name(name: str, category: str):
+    return f"xbin-worker-{category.strip()}-{name.strip()}"
 
 @app.get("/api/v1/system/logs")
 def get_system_logs():
@@ -118,21 +119,19 @@ def get_health():
 @app.post("/api/v1/upload")
 async def upload_binary(file: UploadFile = File(...), requested_analyses: str = Form("")):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
     analyses = [a.strip() for a in requested_analyses.split(",") if a.strip()]
-    sys_log(f"Upload: {file.filename} (Goals: {analyses})")
+    sys_log(f"Upload: {file.filename} for {analyses}")
     r.publish("xbin:events", json.dumps({"type": "NEW_BINARY", "filename": file.filename, "path": f"/app/uploads/{file.filename}", "requested_analyses": analyses}))
     return {"status": "success"}
 
 @app.get("/api/v1/plugins/{name}/logs")
-def get_plugin_logs(name: str):
-    container_name = f"xbin-worker-{name}"
+def get_plugin_logs(name: str, category: str):
+    container_name = get_container_name(name, category)
     try:
         res = subprocess.run(["docker", "logs", "--tail", "100", container_name], capture_output=True, text=True)
         return {"logs": res.stdout + res.stderr}
-    except Exception as e:
-        return {"logs": f"Error: {e}"}
+    except Exception as e: return {"logs": f"Error: {e}"}
 
 @app.get("/api/v1/plugins/available")
 def list_available_plugins():
@@ -143,36 +142,35 @@ def list_available_plugins():
     for line in res.stdout.splitlines():
         name, status, state = line.split("|")
         docker_data[name.replace("xbin-worker-", "")] = {"status": status, "state": state}
-    
     available = []
     health_data = r.hgetall("xbin:worker_health")
     now = time.time()
     for root, dirs, files in os.walk(PLUGINS_DIR):
         if "Dockerfile" in files:
             name = os.path.basename(root); category = os.path.basename(os.path.dirname(root))
+            unique_id = f"{category}-{name}"
             state_str = r.get(f"xbin:plugin_state:{name}")
             saved = json.loads(state_str) if state_str else {"status": "STOPPED"}
             status = saved["status"]
-            if name in docker_data:
-                d = docker_data[name]
+            if unique_id in docker_data:
+                d = docker_data[unique_id]
                 status = "RUNNING" if d["state"] == "running" else "CRASHED" if "Exited (0)" not in d["status"] else "STOPPED"
-            
             health_status = "UNKNOWN"; last_beat = 0
             for w_id, w_val in health_data.items():
                 w_data = json.loads(w_val)
                 if w_data.get("backend") == name:
-                    last_beat = w_data["last_heartbeat"]
-                    health_status = "HEALTHY" if (now - last_beat) < 10 else "DEAD"
+                    last_beat = w_data["last_heartbeat"]; health_status = "HEALTHY" if (now - last_beat) < 10 else "DEAD"
             available.append({"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error")})
     return {"plugins": available}
 
 def bg_start_plugin(name: str, category: str):
-    image_name, container_name = f"xbin-plugin-{name}", f"xbin-worker-{name}"
+    container_name = get_container_name(name, category)
+    image_name = f"xbin-plugin-{category}-{name}"
     try:
         set_plugin_state(name, "BUILDING")
         subprocess.run(["docker", "build", "-t", image_name, "-f", os.path.join(PLUGINS_DIR, category, name, "Dockerfile"), "."], check=True, stdout=subprocess.DEVNULL)
         set_plugin_state(name, "STARTING")
-        subprocess.run(["docker", "rm", "-f", container_name], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         abs_uploads = os.path.abspath(UPLOAD_DIR)
         run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1", image_name]
         subprocess.run(run_cmd, check=True, stdout=subprocess.DEVNULL)
@@ -185,22 +183,27 @@ def start_plugin(name: str, category: str, background_tasks: BackgroundTasks):
     return {"status": "accepted"}
 
 @app.post("/api/v1/plugins/{name}/stop")
-def stop_plugin(name: str):
-    subprocess.run(["docker", "rm", "-f", f"xbin-worker-{name}"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+def stop_plugin(name: str, category: str):
+    container_name = get_container_name(name, category)
+    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
     set_plugin_state(name, "STOPPED")
     return {"status": "success"}
 
-@app.get("/api/v1/blackboard/{analysis_type}")
+@app.get("/api/v1/blackboard/{analysis_type}/audit")
+def get_blackboard_audit(analysis_type: str):
+    cat = analysis_type.strip(); audit_key = f"xbin:bb_logs:{cat}"; logs = r.lrange(audit_key, 0, -1)
+    return {"logs": "\n".join(logs) if logs else "No history recorded yet."}
+
+@app.get("/api/v1/blackboard/{analysis_type}/results")
 def get_analysis_results(analysis_type: str):
-    keys = r.keys(f"xbin:bb:{analysis_type}:*")
-    return {"analysis_type": analysis_type, "results": {k.split(":")[-1]: json.loads(r.get(k)) for k in keys}}
+    keys = r.keys(f"xbin:bb:{analysis_type.strip()}:*")
+    return {"results": {k.split(":")[-1]: json.loads(r.get(k)) for k in keys}}
 
 @app.get("/api/v1/blackboard/{analysis_type}/{item_key}/consensus")
 def get_consensus(analysis_type: str, item_key: str):
-    state_str = r.get(f"xbin:bb:{analysis_type}:{item_key}")
+    state_str = r.get(f"xbin:bb:{analysis_type.strip()}:{item_key}")
     if not state_str: raise HTTPException(status_code=404)
-    state = json.loads(state_str)
-    consensus = {"nodes": {}, "edges": {}}
+    state = json.loads(state_str); consensus = {"nodes": {}, "edges": {}}
     for hyp in state["hypotheses"]:
         backend = hyp["backend"]; confidence = hyp.get("raw_conf", 1.0); data = hyp["data"]
         for node in data.get("nodes", []):
@@ -213,27 +216,13 @@ def get_consensus(analysis_type: str, item_key: str):
             consensus["edges"][eid]["vouches"].append({"backend": backend, "confidence": confidence})
     return consensus
 
-@app.get("/api/v1/blackboard/{analysis_type}/audit")
-def get_blackboard_audit(analysis_type: str):
-    print(f"[*] Audit API called for {analysis_type}")
-    cat = analysis_type.strip()
-    audit_key = f"xbin:bb_logs:{cat}"
-    sys_log(f"Retrieving audit logs from {audit_key}...")
-    logs = r.lrange(audit_key, 0, -1)
-    if not logs:
-        sys_log(f"No audit logs found for {cat}")
-        return {"logs": "No history recorded yet."}
-    content = "\n".join(logs)
-    sys_log(f"Returning {len(logs)} audit entries.")
-    return {"logs": content}
-
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>xbin | Intelligent Analysis Dashboard</title>
+        <title>xbin | Visual Analysis Dashboard</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
         <style>
             :root { --bg: #0b0f1a; --card: #161e2e; --text: #f3f4f6; --accent: #3b82f6; --danger: #ef4444; --success: #10b981; --warning: #f59e0b; --muted: #6b7280; --border: #2d3748; }
@@ -263,14 +252,14 @@ def dashboard():
             #modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 85vw; height: 80vh; background: var(--card); border: 1px solid var(--accent); border-radius: 16px; padding: 2rem; z-index: 1000; display: none; flex-direction: column; box-shadow: 0 0 40px rgba(0,0,0,0.8); }
             .log-box { flex: 1; background: #070a13; padding: 1.5rem; border-radius: 8px; font-family: monospace; font-size: 0.75rem; color: #cbd5e1; overflow-y: auto; border: 1px solid var(--border); white-space: pre-wrap; }
             #cy-container { flex: 1; background: #070a13; border-radius: 8px; border: 1px solid var(--border); margin-top: 1rem; width: 100%; height: 100%; }
+            #mem-map-container { background: #070a13; border-radius: 8px; border: 1px solid var(--border); padding: 1rem; margin-top: 1rem; display: none; overflow-x: auto; white-space: nowrap; height: 120px; position: relative; }
+            .mem-block { position: absolute; height: 40px; top: 40px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.1); cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; font-size: 0.6rem; color: white; overflow: hidden; }
+            .mem-block:hover { transform: translateY(-5px); box-shadow: 0 5px 15px rgba(59, 130, 246, 0.4); z-index: 10; }
+            .mem-label { position: absolute; top: 10px; font-size: 0.6rem; color: var(--muted); border-left: 1px solid var(--border); padding-left: 4px; }
             .toast-container { position: fixed; bottom: 2rem; right: 2rem; z-index: 2000; }
             .toast { background: var(--card); border: 1px solid var(--accent); padding: 1rem; border-radius: 8px; box-shadow: 0 10px 20px rgba(0,0,0,0.5); margin-top: 0.5rem; animation: slideIn 0.3s ease; }
             @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
-
-            @keyframes logo-ripple { 
-                0% { transform: scale(1); opacity: 0.8; }
-                100% { transform: scale(2.5); opacity: 0; }
-            }
+            @keyframes logo-ripple { 0% { transform: scale(1); opacity: 0.8; } 100% { transform: scale(2.5); opacity: 0; } }
             .logo-orb { position: relative; width: 30px; height: 30px; }
             .logo-ripple { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: var(--accent); border-radius: 6px; z-index: 1; animation: logo-ripple 2s infinite; }
             .logo-x { position: relative; z-index: 2; background: var(--accent); width: 30px; height: 30px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 900; box-shadow: 0 0 15px rgba(59, 130, 246, 0.5); }
@@ -279,10 +268,7 @@ def dashboard():
     <body>
         <header>
             <div style="display: flex; align-items: center; gap: 1rem;">
-                <div class="logo-orb">
-                    <div class="logo-ripple"></div>
-                    <div class="logo-x">X</div>
-                </div>
+                <div class="logo-orb"><div class="logo-ripple"></div><div class="logo-x">X</div></div>
                 <h1 style="margin: 0; font-size: 1.1rem;">xbin <span style="font-weight: 300; color: var(--muted);">Blackboard</span></h1>
             </div>
             <div style="display: flex; gap: 1rem; align-items: center;">
@@ -297,11 +283,12 @@ def dashboard():
                 <div class="card">
                     <h2>Deploy Analysis</h2>
                     <input type="file" id="f" style="display:none" onchange="document.getElementById('fl').innerText=this.files[0].name">
-                    <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Binary</span></button>
+                    <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Choose Binary</span></button>
                     <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.4rem;">
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="symbol_matching" checked> Symbols</label>
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="cfg_generation" checked> CFG</label>
+                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="function_boundary" checked> Boundaries</label>
                         </div>
                     </div>
                     <button class="btn btn-primary" style="width:100%; margin-top:1rem; background:var(--success)" onclick="upload()">🚀 Start Analysis</button>
@@ -322,6 +309,7 @@ def dashboard():
             </div>
             <div id="modal-content" class="log-box"></div>
             <div id="cy-container" style="display:none"></div>
+            <div id="mem-map-container" style="display:none"></div>
         </div>
         <div class="toast-container" id="toasts"></div>
         <script>
@@ -333,12 +321,7 @@ def dashboard():
                 fd.append('requested_analyses', goals.join(','));
                 await fetch('/api/v1/upload', {method:'POST', body:fd}); toast('Binary Announced');
             }
-            async function clearSession() {
-                if(confirm('Clear all data?')) {
-                    await fetch('/api/v1/session/clear', {method:'POST'});
-                    location.reload();
-                }
-            }
+            async function clearSession() { if(confirm('Clear all data?')) { await fetch('/api/v1/session/clear', {method:'POST'}); location.reload(); } }
             async function toggle(n,c,s) { const action=s==='RUNNING'?'stop':'start'; await fetch(`/api/v1/plugins/${n}/${action}?category=${c}`, {method:'POST'}); refresh(); }
             async function bulkAction(a, category = null) {
                 const res=await fetch('/api/v1/plugins/available'); const data=await res.json();
@@ -350,37 +333,30 @@ def dashboard():
                 });
                 toast(`${a==='start'?'Deploying':'Stopping'} ${targets.length} plugins...`);
                 targets.forEach(p => {
-                    const url = a === 'start' ? `/api/v1/plugins/${p.name}/start?category=${p.category}` : `/api/v1/plugins/${p.name}/stop`;
+                    const url = a === 'start' ? `/api/v1/plugins/${p.name}/start?category=${p.category}` : `/api/v1/plugins/${p.name}/stop?category=${p.category}`;
                     fetch(url, {method:'POST'});
                 });
             }
-            async function showLogs(n) {
+            async function showLogs(n, c="") {
                 document.getElementById('modal-title').innerText=`Logs: ${n}`;
-                document.getElementById('cy-container').style.display='none';
-                document.getElementById('modal-content').style.display='block';
-                document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
-                const res = await fetch(`/api/v1/plugins/${n}/logs`); const d = await res.json();
+                document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
+                document.getElementById('modal-content').style.display='block'; document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
+                const res = await fetch(`/api/v1/plugins/${n}/logs?category=${c}`); const d = await res.json();
                 document.getElementById('modal-content').innerText = d.logs || 'No output.';
             }
             function showSystemLogs() {
                 document.getElementById('modal-title').innerText='System Logs';
-                document.getElementById('cy-container').style.display='none';
-                document.getElementById('modal-legend').innerHTML = '';
-                document.getElementById('modal-content').style.display='block';
+                document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
+                document.getElementById('modal-legend').innerHTML = ''; document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
                 fetch('/api/v1/system/logs').then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs);
             }
             function showBlackboardLogs(cat) {
-                console.log("Fetching audit for " + cat);
                 document.getElementById('modal-title').innerText=`Audit Trail: ${cat}`;
-                document.getElementById('cy-container').style.display='none';
-                document.getElementById('modal-legend').innerHTML = '';
-                document.getElementById('modal-content').style.display='block';
+                document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
+                document.getElementById('modal-legend').innerHTML = ''; document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
-                fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>{
-                    console.log("Received audit logs", d);
-                    document.getElementById('modal-content').innerText=d.logs || 'No entries yet.';
-                });
+                fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs || 'No entries.');
             }
             async function showConsensus(cat, item) {
                 const modal = document.getElementById('modal'); const overlay = document.getElementById('overlay');
@@ -423,6 +399,27 @@ def dashboard():
                     });
                 } catch (e) { cyContainer.innerHTML = `<div style="color:var(--danger); padding:2rem;">Error: ${e.message}</div>`; }
             }
+            function visualizeBoundaries(data) {
+                document.getElementById('modal-title').innerText='Function Boundary Map';
+                document.getElementById('modal-content').style.display='none'; document.getElementById('cy-container').style.display='none';
+                const container = document.getElementById('mem-map-container'); container.style.display = 'block'; container.innerHTML = '';
+                document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
+                const addresses = Object.keys(data).map(a => parseInt(a, 16)).sort((a,b) => a-b);
+                if (addresses.length === 0) return;
+                const min = addresses[0]; const max = addresses[addresses.length-1] + (data[hex(addresses[addresses.length-1])].hypotheses[0].data.size || 100);
+                const range = max - min; const viewWidth = 1000;
+                addresses.forEach(addr => {
+                    const func = data[hex(addr)]; const top = func.hypotheses[0]; const meta = top.data;
+                    const left = ((addr - min) / range) * viewWidth; const width = (meta.size / range) * viewWidth;
+                    const block = document.createElement('div'); block.className = 'mem-block'; block.style.left = `${left}px`; block.style.width = `${Math.max(width, 2)}px`;
+                    block.style.background = top.backend.includes('angr') ? '#3b82f6' : '#10b981';
+                    block.innerText = meta.name_hint || hex(addr); block.title = `${hex(addr)} - ${meta.end}`;
+                    container.appendChild(block);
+                    const label = document.createElement('div'); label.className = 'mem-label'; label.style.left = `${left}px`; label.innerText = hex(addr);
+                    container.appendChild(label);
+                });
+            }
+            function hex(n) { return '0x' + n.toString(16); }
             function copyLogs() { navigator.clipboard.writeText(document.getElementById('modal-content').innerText); toast('Copied!'); }
             function closeModal() { document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
             async function refresh() {
@@ -435,20 +432,24 @@ def dashboard():
                         html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:1.5rem 0 0.5rem;"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; font-weight:700;">${cat.replace('_',' ')}</div><div style="display:flex; gap:0.25rem"><button class="btn btn-action" onclick="bulkAction('stop', '${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start', '${cat}')">Start</button></div></div>`;
                         cats[cat].forEach(p => {
                             const isNewBeat = p.last_beat > (lastHeartbeats[p.name] || 0);
-                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div></div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
+                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div></div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}','${p.category}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
                             if (isNewBeat) lastHeartbeats[p.name] = p.last_beat;
                         });
                     }
                     if (pluginList.innerHTML !== html) pluginList.innerHTML = html;
                     const bb = document.getElementById('bb-content');
-                    const categories = [...new Set([...pData.plugins.map(p => p.category), 'symbol_matching', 'cfg_generation'])];
+                    const categories = [...new Set([...pData.plugins.map(p => p.category), 'symbol_matching', 'cfg_generation', 'function_boundary'])];
                     for (let cat of categories) {
-                        const res = await fetch(`/api/v1/blackboard/${cat}`); const d = await res.json();
+                        const res = await fetch(`/api/v1/blackboard/${cat}/results`); const d = await res.json();
                         let catId = `bb-section-${cat}`; let section = document.getElementById(catId);
                         if (Object.keys(d.results).length > 0) {
                             if (!section) { section = document.createElement('div'); section.id = catId; section.className = 'card'; bb.appendChild(section); }
-                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><h2>${cat.replace('_',' ')}</h2><button class="btn btn-action" style="background:#2d3748" onclick="showBlackboardLogs('${cat}')">Audit Trail</button></div><table><thead><tr><th>Target</th><th>Result</th><th>Action</th></tr></thead><tbody>`;
-                            for(let k in d.results) { const item = d.results[k]; tableHtml += `<tr class="bb-row"><td><code>${k}</code></td><td style="color:var(--accent); font-weight:500;">Hypothesis by ${item.hypotheses[0].backend}</td><td>${cat==='cfg_generation'?'<button class="btn btn-primary btn-action" onclick="showConsensus(\\''+cat+'\\',\\''+k+'\\')">Visual Graph</button>':''}</td></tr>`; }
+                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><h2>${cat.replace('_',' ')}</h2><div style="display:flex; gap:0.5rem;"><button class="btn btn-action" onclick="showBlackboardLogs('${cat}')">Audit Trail</button>${cat==='function_boundary'?'<button class="btn btn-primary btn-action" onclick=\\'visualizeBoundaries('+JSON.stringify(d.results)+')\\'>View Map</button>':''}</div></div><table><thead><tr><th>${cat==='function_boundary'?'Address':'Target'}</th><th>${cat==='function_boundary'?'End / Size':'Result'}</th><th>Action</th></tr></thead><tbody>`;
+                            for(let k in d.results) { 
+                                const item = d.results[k]; const top = item.hypotheses[0];
+                                let resText = cat === 'function_boundary' ? `${top.data.end} (${top.data.size}b)` : (typeof top.data === 'string' ? top.data : JSON.stringify(top.data).substring(0,30)+'...');
+                                tableHtml += `<tr class="bb-row"><td><code>${k}</code></td><td style="color:var(--accent); font-weight:500;">${resText}</td><td>${cat==='cfg_generation'?'<button class="btn btn-primary btn-action" onclick="showConsensus(\\''+cat+'\\',\\''+k+'\\')">Visual Graph</button>':''} <span style="font-size:0.6rem; color:var(--muted)">via ${top.backend}</span></td></tr>`; 
+                            }
                             tableHtml += '</tbody></table>';
                             if (section.innerHTML !== tableHtml) { section.innerHTML = tableHtml; section.style.animation = 'glow-pulse 0.5s ease-out'; }
                         }
@@ -478,21 +479,15 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         return orchestrator_pb2.HeartbeatResponse(acknowledged=True)
 
     def PostResult(self, request, context):
-        # Clean and verify category
         cat = request.analysis_type.strip()
         bb_key = f"xbin:bb:{cat}:{request.item_key}"
         weight = BACKEND_WEIGHTS.get(request.backend_name, 0.50)
-        
-        # Record Audit Log for this Category
         timestamp = time.strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] {request.backend_name} -> {request.item_key} (Conf: {request.confidence})"
-        
-        # Use a more explicit log key
         audit_key = f"xbin:bb_logs:{cat}"
         r.lpush(audit_key, log_entry)
         r.ltrim(audit_key, 0, 100)
         sys_log(f"Audit entry added to {audit_key}")
-
         new_hyp = {
             "data": json.loads(request.result_data), 
             "score": round(request.confidence * weight, 3), 
@@ -506,15 +501,12 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
             if state["hypotheses"][0]["data"] != state["hypotheses"][1]["data"] and (state["hypotheses"][0]["score"] - state["hypotheses"][1]["score"]) <= MARGIN_THRESHOLD:
                 status = "CONFLICTED"
         state["status"] = status; r.set(bb_key, json.dumps(state))
-        sys_log(f"Update [{request.analysis_type}]: {request.item_key}")
-        r.publish("xbin:events", json.dumps({"type": "BLACKBOARD_UPDATE", "analysis_type": request.analysis_type, "item_key": request.item_key, "new_hypothesis": new_hyp, "top_hypothesis": state["hypotheses"][0], "status": status}))
+        sys_log(f"Update [{cat}]: {request.item_key}")
+        r.publish("xbin:events", json.dumps({"type": "BLACKBOARD_UPDATE", "analysis_type": cat, "item_key": request.item_key, "new_hypothesis": new_hyp, "top_hypothesis": state["hypotheses"][0], "status": status}))
         return orchestrator_pb2.PostResultResponse(accepted=True, current_status=status)
 
 def main():
-    ensure_redis()
-    r.flushdb() # Clean slate for the new session
-    cleanup_stale_plugins()
-    
+    ensure_redis(); cleanup_stale_plugins(); r.flushdb()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     orchestrator_pb2_grpc.add_OrchestratorServiceServicer_to_server(XbinOrchestratorServicer(), server)
     server.add_insecure_port(GRPC_PORT); server.start()
