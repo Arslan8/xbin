@@ -7,6 +7,10 @@ import subprocess
 import shutil
 import hashlib
 import sys
+import webbrowser
+import socket
+import argparse
+import argcomplete
 
 import grpc
 import redis
@@ -218,6 +222,15 @@ def stop_plugin(name: str, category: str):
     set_plugin_state(name, "STOPPED")
     return {"status": "success"}
 
+@app.post("/api/v1/shutdown")
+def shutdown_backend():
+    sys_log("Backend shutdown requested via API.")
+    def kill_server():
+        time.sleep(1)
+        os._exit(0)
+    threading.Thread(target=kill_server).start()
+    return {"status": "shutting_down"}
+
 @app.get("/api/v1/blackboard/{analysis_type}/audit")
 def get_blackboard_audit(analysis_type: str):
     cat = analysis_type.strip(); audit_key = f"xbin:bb_logs:{cat}"; logs = r.lrange(audit_key, 0, -1)
@@ -306,6 +319,7 @@ def dashboard():
                 <button class="btn" style="background: #2d3748;" onclick="showSystemLogs()">System Logs</button>
                 <button class="btn btn-danger btn-action" onclick="clearSession()">Clear Session</button>
                 <button class="btn btn-primary btn-action" onclick="bulkAction('start')">Start Fleet</button>
+                <button class="btn btn-danger btn-action" onclick="powerOff()">Power Off</button>
                 <div id="orc-health" class="badge badge-running">Orchestrator: OK</div>
             </div>
         </header>
@@ -351,6 +365,13 @@ def dashboard():
                 const goals=Array.from(document.querySelectorAll('.goal:checked')).map(i=>i.value);
                 fd.append('requested_analyses', goals.join(','));
                 await fetch('/api/v1/upload', {method:'POST', body:fd}); toast('Binary Announced');
+            }
+            async function powerOff() {
+                if(confirm('Are you sure you want to shut down the xbin orchestrator?')) {
+                    toast('Shutting down...');
+                    try { await fetch('/api/v1/shutdown', {method:'POST'}); } catch(e) {}
+                    setTimeout(() => { document.body.innerHTML = '<div style="display:flex; justify-content:center; align-items:center; height:100vh; font-size:2rem; color:var(--muted);">Backend Offline. You can safely close this tab.</div>'; }, 1000);
+                }
             }
             async function clearSession() { if(confirm('Clear all data?')) { await fetch('/api/v1/session/clear', {method:'POST'}); location.reload(); } }
             async function toggle(n,c,s) { const action=s==='RUNNING'?'stop':'start'; await fetch(`/api/v1/plugins/${n}/${action}?category=${c}`, {method:'POST'}); refresh(); }
@@ -453,19 +474,37 @@ def dashboard():
             function hex(n) { return '0x' + n.toString(16); }
             function copyLogs() { navigator.clipboard.writeText(document.getElementById('modal-content').innerText); toast('Copied!'); }
             function closeModal() { document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
+            let collapsedCategories = {};
+            function toggleCategory(cat) {
+                collapsedCategories[cat] = !collapsedCategories[cat];
+                const content = document.getElementById(`cat-content-${cat}`);
+                const arrow = document.getElementById(`cat-arrow-${cat}`);
+                if (content) content.style.display = collapsedCategories[cat] ? 'none' : 'block';
+                if (arrow) arrow.style.transform = collapsedCategories[cat] ? 'rotate(-90deg)' : 'rotate(0deg)';
+            }
+            
+            let isOffline = false;
             async function refresh() {
                 try {
-                    const pRes = await fetch('/api/v1/plugins/available'); const pData = await pRes.json();
+                    const pRes = await fetch('/api/v1/plugins/available'); 
+                    if (isOffline) {
+                        location.reload();
+                        return;
+                    }
+                    const pData = await pRes.json();
                     const pluginList = document.getElementById('plugin-list');
                     const cats = {}; pData.plugins.forEach(p => { if(!cats[p.category]) cats[p.category]=[]; cats[p.category].push(p); });
                     let html = '';
                     for(let cat in cats) {
-                        html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:1.5rem 0 0.5rem;"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; font-weight:700;">${cat.replace('_',' ')}</div><div style="display:flex; gap:0.25rem"><button class="btn btn-action" onclick="bulkAction('stop', '${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start', '${cat}')">Start</button></div></div>`;
+                        const isCollapsed = collapsedCategories[cat];
+                        html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:1.5rem 0 0.5rem; cursor:pointer; user-select:none;" onclick="toggleCategory('${cat}')"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; font-weight:700;"><span id="cat-arrow-${cat}" style="display:inline-block; transition:transform 0.2s; transform:${isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)'};">&#9660;</span> ${cat.replace('_',' ')}</div><div style="display:flex; gap:0.25rem" onclick="event.stopPropagation()"><button class="btn btn-action" onclick="bulkAction('stop', '${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start', '${cat}')">Start</button></div></div>`;
+                        html += `<div id="cat-content-${cat}" style="display:${isCollapsed ? 'none' : 'block'};">`;
                         cats[cat].forEach(p => {
                             const isNewBeat = p.last_beat > (lastHeartbeats[p.name] || 0);
-                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.is_validator ? '<div class="badge badge-validator">Validator</div>' : ''}${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div></div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}','${p.category}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
+                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.is_validator ? '<div class="badge badge-validator">Validator</div>' : ''}${p.is_ranker ? '<div class="badge badge-ranker" style="font-style:normal;">Ranker</div>' : ''}${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div></div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}','${p.category}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
                             if (isNewBeat) lastHeartbeats[p.name] = p.last_beat;
                         });
+                        html += `</div>`;
                     }
                     if (pluginList.innerHTML !== html) pluginList.innerHTML = html;
                     const bb = document.getElementById('bb-content');
@@ -490,7 +529,17 @@ def dashboard():
                             if (section.innerHTML !== tableHtml) { section.innerHTML = tableHtml; section.style.animation = 'glow-pulse 0.5s ease-out'; }
                         }
                     }
-                } catch(e) { }
+                    const badge = document.getElementById('orc-health');
+                    if(badge) { badge.className = 'badge badge-running'; badge.innerText = 'Orchestrator: OK'; }
+                } catch(e) {
+                    const badge = document.getElementById('orc-health');
+                    if(badge) { badge.className = 'badge badge-error'; badge.innerText = 'Backend Offline'; badge.style.background = 'rgba(239, 68, 68, 0.1)'; badge.style.color = 'var(--danger)'; }
+                    // If we failed to fetch entirely (e.g. backend dead), show an overlay
+                    if(e instanceof TypeError) {
+                        isOffline = true;
+                        document.body.innerHTML = '<style>@keyframes floatOff { 0% { transform: translateY(0px) rotate(0deg); } 50% { transform: translateY(-15px) rotate(5deg); } 100% { transform: translateY(0px) rotate(0deg); } } @keyframes glowOff { 0% { filter: drop-shadow(0 0 10px rgba(239,68,68,0.2)); } 50% { filter: drop-shadow(0 0 40px rgba(239,68,68,0.7)); } 100% { filter: drop-shadow(0 0 10px rgba(239,68,68,0.2)); } }</style><div style="display:flex; justify-content:center; align-items:center; height:100vh; flex-direction:column; gap:1.5rem; background: radial-gradient(circle at center, #1a0b10 0%, var(--bg) 100%);"><div style="font-size: 7rem; animation: floatOff 4s ease-in-out infinite, glowOff 2s infinite;">🔌</div><div style="font-size:2.5rem; color:var(--danger); font-weight:800; letter-spacing:0.1em; text-transform:uppercase;">Connection Lost</div><div style="font-size:1rem; color:var(--muted); max-width:400px; text-align:center; line-height:1.5;">The xbin Orchestrator has gone offline.<br>Restart the backend process to resume analysis.<br><br><span style="font-size:0.8rem; color:var(--accent); animation: blink 1.5s infinite;">Waiting for connection to return...</span></div></div>';
+                    }
+                }
             }
             setInterval(refresh, 2000); refresh();
         </script>
@@ -640,12 +689,31 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         }))
         return orchestrator_pb2.UpdateRankResponse(accepted=True)
 
+def is_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
+
 def main():
+    parser = argparse.ArgumentParser(description="xbin Orchestrator")
+    parser.add_argument("--no-browser", action="store_true", help="Do not automatically open the dashboard in a browser.")
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
     ensure_redis(); cleanup_stale_plugins(); r.flushdb()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     orchestrator_pb2_grpc.add_OrchestratorServiceServicer_to_server(XbinOrchestratorServicer(), server)
     server.add_insecure_port(GRPC_PORT); server.start()
     sys_log("xbin Multi-Analysis Engine Online")
+    
+    # Only open browser if the flag isn't set
+    if not args.no_browser:
+        def open_browser():
+            time.sleep(1) # Give Uvicorn a moment to bind
+            print(f"[*] Opening dashboard at http://localhost:{REST_PORT} ...")
+            webbrowser.open(f"http://localhost:{REST_PORT}")
+            
+        threading.Thread(target=open_browser, daemon=True).start()
+        
     uvicorn.run(app, host="0.0.0.0", port=REST_PORT, log_level="warning")
 
 if __name__ == '__main__':
