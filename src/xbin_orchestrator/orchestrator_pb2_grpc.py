@@ -44,6 +44,11 @@ class OrchestratorServiceStub:
                 request_serializer=orchestrator__pb2.PostResultRequest.SerializeToString,
                 response_deserializer=orchestrator__pb2.PostResultResponse.FromString,
                 _registered_method=True)
+        self.UpdateRank = channel.unary_unary(
+                '/orchestrator.OrchestratorService/UpdateRank',
+                request_serializer=orchestrator__pb2.UpdateRankRequest.SerializeToString,
+                response_deserializer=orchestrator__pb2.UpdateRankResponse.FromString,
+                _registered_method=True)
         self.Heartbeat = channel.unary_unary(
                 '/orchestrator.OrchestratorService/Heartbeat',
                 request_serializer=orchestrator__pb2.HeartbeatRequest.SerializeToString,
@@ -66,6 +71,13 @@ class OrchestratorServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UpdateRank(self, request, context):
+        """NEW: External rankers call this
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Heartbeat(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -84,6 +96,11 @@ def add_OrchestratorServiceServicer_to_server(servicer, server):
                     servicer.PostResult,
                     request_deserializer=orchestrator__pb2.PostResultRequest.FromString,
                     response_serializer=orchestrator__pb2.PostResultResponse.SerializeToString,
+            ),
+            'UpdateRank': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateRank,
+                    request_deserializer=orchestrator__pb2.UpdateRankRequest.FromString,
+                    response_serializer=orchestrator__pb2.UpdateRankResponse.SerializeToString,
             ),
             'Heartbeat': grpc.unary_unary_rpc_method_handler(
                     servicer.Heartbeat,
@@ -145,6 +162,33 @@ class OrchestratorService:
             '/orchestrator.OrchestratorService/PostResult',
             orchestrator__pb2.PostResultRequest.SerializeToString,
             orchestrator__pb2.PostResultResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateRank(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/orchestrator.OrchestratorService/UpdateRank',
+            orchestrator__pb2.UpdateRankRequest.SerializeToString,
+            orchestrator__pb2.UpdateRankResponse.FromString,
             options,
             channel_credentials,
             insecure,

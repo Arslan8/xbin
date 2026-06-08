@@ -40,6 +40,18 @@ The primary method for contributing analysis or validations to the blackboard. T
     - `accepted` (bool): True if the hypothesis was recorded.
     - `current_status` (string): The new resolution status of the item (e.g., `RESOLVED`, `CONFLICTED`).
 
+### 4. `UpdateRank`
+Used exclusively by **Ranker plugins** to dynamically override the consensus score of an existing hypothesis based on custom heuristics.
+
+- **Request (`UpdateRankRequest`)**:
+    - `analysis_type` (string): The blackboard category.
+    - `item_key` (string): The unique identifier for the item.
+    - `target_hypothesis_id` (string): The specific hypothesis ID to modify.
+    - `new_score` (float): The newly calculated rank score.
+    - `backend_name` (string): The identity of the Ranker issuing the update.
+- **Response (`UpdateRankResponse`)**:
+    - `accepted` (bool): True if the score was successfully updated.
+
 ---
 
 ## Analysis Category Data Standards (`result_data`)

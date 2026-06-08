@@ -9,15 +9,16 @@ Instead of a monolithic analyzer, **xbin** uses a **Blackboard Architecture**. M
 Traditional binary analysis tools are often isolated silos. **xbin** changes this by fostering an ecosystem where:
 - **Tools Compete**: Multiple backends can solve the same problem (e.g., CFG generation). The blackboard uses weighted confidence to determine the "truth."
 - **Tools Collaborate**: A symbol matcher can wait for a CFG generator to finish and then use that graph as context for better matching.
-- **Tools Validate**: Specialized plugins can sanity-check or "vouch" for the findings of other tools, preventing "hallucinations" or analysis errors from dominating the consensus.
+- **Tools Validate**: Specialized plugins can sanity-check or "vouch" for the findings of other tools, preventing "hallucinations".
+- **Tools Judge**: "Ranker" plugins dynamically adjust the consensus math based on local heuristics (e.g., heavily rewarding a finding if two specific backends agree).
 - **Agentic Ready**: Designed for human-in-the-loop or AI-agent arbitration when tools disagree (Conflict Resolution).
 - **Reactive**: The system is entirely event-driven via Redis Pub/Sub. When a binary is uploaded, the fleet reacts instantly.
 
 ## 🚀 Features
 
 - **Multi-Analysis Support**: Separate blackboards for `symbol_matching`, `cfg_generation`, `decompilation`, and more.
-- **Analysis vs. Validation**: Supports both data producers (analyzers) and data verifiers (validators).
-- **Consensus Visualizer**: Interactive Cytoscape.js graphs that show "vouches" (which tools agreed on which node/edge) and checkmarks for verified results.
+- **The Triad Architecture**: Build tools as **Producers** (Analyzers), **Verifiers** (Validators), or **Judges** (Rankers).
+- **Consensus Visualizer**: Interactive Cytoscape.js graphs that show "vouches" (which tools agreed on which node/edge), checkmarks for verified results, and the active Ranker algorithm.
 - **Reactive SDK**: A class-based Python SDK that abstracts away all gRPC/Docker boilerplate.
 - **Dynamic Orchestration**: The orchestrator manages its own Redis and sibling plugin containers.
 - **Health Monitoring**: Real-time heartbeats and visual "pulse" animations on the dashboard.
@@ -74,6 +75,20 @@ CMD ["python", "my_worker.py"]
 
 ### 3. Register
 Drop your folder into `plugins/<category>/`. The orchestrator will automatically find it and show a **Start** button on the dashboard.
+
+## 🧪 Testing
+
+The project includes an automated integration test suite using `pytest`. The tests verify the core Blackboard logic, including Analyzer submissions, Validator vouching, and Ranker overrides.
+
+To run the test suite:
+```bash
+# Ensure pytest is installed
+pip install pytest
+
+# Run the suite
+pytest tests/ -v
+```
+The test suite automatically spins up a background Orchestrator and isolated Redis instance for the duration of the run.
 
 ## 📡 The RPC Scheme
 

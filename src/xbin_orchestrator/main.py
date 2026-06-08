@@ -157,15 +157,18 @@ def list_available_plugins():
             saved = json.loads(state_str) if state_str else {"status": "STOPPED"}
             status = saved["status"]
             
-            # Static discovery: Check if is_validator=True in source files
+            # Static discovery: Check if is_validator/is_ranker=True in source files
             is_validator = saved.get("is_validator", False)
-            if not is_validator:
+            is_ranker = saved.get("is_ranker", False)
+            if not is_validator or not is_ranker:
                 for f in files:
                     if f.endswith(".py"):
                         try:
                             with open(os.path.join(root, f), "r") as pf:
-                                if "is_validator=True" in pf.read():
-                                    is_validator = True; break
+                                content = pf.read()
+                                if "is_validator=True" in content: is_validator = True
+                                if "is_ranker=True" in content: is_ranker = True
+                                if is_validator and is_ranker: break
                         except: pass
 
             if unique_id in docker_data:
@@ -178,8 +181,16 @@ def list_available_plugins():
                     last_beat = w_data["last_heartbeat"]; health_status = "HEALTHY" if (now - last_beat) < 10 else "DEAD"
                     # Registration-time status takes precedence if active
                     if "is_validator" in w_data: is_validator = w_data["is_validator"]
-            available.append({"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error"), "is_validator": is_validator})
-    return {"plugins": available}
+                    if "is_ranker" in w_data: is_ranker = w_data["is_ranker"]
+            available.append({"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error"), "is_validator": is_validator, "is_ranker": is_ranker})
+    
+    # Map each category to its active ranker name (if any is registered)
+    categories = list(set([p["category"] for p in available] + ["symbol_matching", "cfg_generation", "function_boundary"]))
+    ranker_map = {}
+    for cat in categories:
+        ranker_map[cat] = next((p["name"] for p in available if p["category"] == cat and p["is_ranker"]), "Baseline")
+    
+    return {"plugins": available, "rankers": ranker_map}
 
 def bg_start_plugin(name: str, category: str):
     container_name = get_container_name(name, category)
@@ -262,6 +273,7 @@ def dashboard():
             .badge { padding: 0.2rem 0.5rem; border-radius: 99px; font-size: 0.6rem; font-weight: 800; text-transform: uppercase; }
             .badge-running { background: rgba(16, 185, 129, 0.1); color: var(--success); }
             .badge-validator { background: rgba(139, 92, 246, 0.1); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); }
+            .badge-ranker { background: rgba(59, 130, 246, 0.1); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); font-style: italic; }
             .badge-wait { background: rgba(245, 158, 11, 0.1); color: var(--warning); animation: blink 1.5s infinite; }
             @keyframes blink { 50% { opacity: 0.5; } }
             table { width: 100%; border-collapse: collapse; }
@@ -457,13 +469,15 @@ def dashboard():
                     }
                     if (pluginList.innerHTML !== html) pluginList.innerHTML = html;
                     const bb = document.getElementById('bb-content');
+                    const rankers = pData.rankers || {};
                     const categories = [...new Set([...pData.plugins.map(p => p.category), 'symbol_matching', 'cfg_generation', 'function_boundary'])];
                     for (let cat of categories) {
                         const res = await fetch(`/api/v1/blackboard/${cat}/results`); const d = await res.json();
                         let catId = `bb-section-${cat}`; let section = document.getElementById(catId);
                         if (Object.keys(d.results).length > 0) {
                             if (!section) { section = document.createElement('div'); section.id = catId; section.className = 'card'; bb.appendChild(section); }
-                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><h2>${cat.replace('_',' ')}</h2><div style="display:flex; gap:0.5rem;"><button class="btn btn-action" onclick="showBlackboardLogs('${cat}')">Audit Trail</button>${cat==='function_boundary'?'<button class="btn btn-primary btn-action" onclick=\\'visualizeBoundaries('+JSON.stringify(d.results)+')\\'>View Map</button>':''}</div></div><table><thead><tr><th>${cat==='function_boundary'?'Address':'Target'}</th><th>${cat==='function_boundary'?'End / Size':'Result'}</th><th>Action</th></tr></thead><tbody>`;
+                            const rankerName = rankers[cat] || "DefaultWeightedRanker";
+                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><div><h2 style="display:inline; margin-right:1rem;">${cat.replace('_',' ')}</h2><div class="badge badge-ranker" style="display:inline; vertical-align:middle;">Ranker: ${rankerName}</div></div><div style="display:flex; gap:0.5rem;"><button class="btn btn-action" onclick="showBlackboardLogs('${cat}')">Audit Trail</button>${cat==='function_boundary'?'<button class="btn btn-primary btn-action" onclick=\\'visualizeBoundaries('+JSON.stringify(d.results)+')\\'>View Map</button>':''}</div></div><table><thead><tr><th>${cat==='function_boundary'?'Address':'Target'}</th><th>${cat==='function_boundary'?'End / Size':'Result'}</th><th>Action</th></tr></thead><tbody>`;
                             for(let k in d.results) { 
                                 const item = d.results[k]; const top = item.hypotheses[0];
                                 const validators = top.validators || [];
@@ -494,16 +508,19 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
             "backend": request.backend_name, 
             "last_heartbeat": time.time(), 
             "message": "Welcome Signal Received",
-            "is_validator": request.is_validator
+            "is_validator": request.is_validator,
+            "is_ranker": request.is_ranker
         }))
         
-        # Persist validator status in long-term plugin state
+        # Persist type status in long-term plugin state
         state_key = f"xbin:plugin_state:{request.backend_name}"
         state = json.loads(r.get(state_key)) if r.exists(state_key) else {"status": "RUNNING"}
         state["is_validator"] = request.is_validator
+        state["is_ranker"] = request.is_ranker
         r.set(state_key, json.dumps(state))
 
-        sys_log(f"Handshake: {request.worker_id} {'[VALIDATOR]' if request.is_validator else ''}")
+        type_str = "[VALIDATOR]" if request.is_validator else "[RANKER]" if request.is_ranker else ""
+        sys_log(f"Handshake: {request.worker_id} {type_str}")
         return orchestrator_pb2.RegisterResponse(success=True)
 
     def Heartbeat(self, request, context):
@@ -587,6 +604,41 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
             "status": status
         }))
         return orchestrator_pb2.PostResultResponse(accepted=True, current_status=status)
+
+    def UpdateRank(self, request, context):
+        cat = request.analysis_type.strip()
+        bb_key = f"xbin:bb:{cat}:{request.item_key}"
+        if not r.exists(bb_key):
+            return orchestrator_pb2.UpdateRankResponse(accepted=False)
+            
+        state = json.loads(r.get(bb_key))
+        target_hyp = next((h for h in state["hypotheses"] if h.get("id") == request.target_hypothesis_id), None)
+        
+        if not target_hyp:
+            return orchestrator_pb2.UpdateRankResponse(accepted=False)
+            
+        target_hyp["score"] = round(request.new_score, 3)
+        state["hypotheses"] = sorted(state["hypotheses"], key=lambda x: x["score"], reverse=True)
+        
+        status = "RESOLVED"
+        if len(state["hypotheses"]) > 1:
+            if state["hypotheses"][0]["data"] != state["hypotheses"][1]["data"] and (state["hypotheses"][0]["score"] - state["hypotheses"][1]["score"]) <= MARGIN_THRESHOLD:
+                status = "CONFLICTED"
+        
+        state["status"] = status
+        r.set(bb_key, json.dumps(state))
+        
+        sys_log(f"Rank Update [{cat}]: {request.item_key} via {request.backend_name}")
+        r.publish("xbin:events", json.dumps({
+            "type": "BLACKBOARD_UPDATE", 
+            "analysis_type": cat, 
+            "item_key": request.item_key, 
+            "new_hypothesis": target_hyp, 
+            "top_hypothesis": state["hypotheses"][0], 
+            "status": status,
+            "is_rank_update": True
+        }))
+        return orchestrator_pb2.UpdateRankResponse(accepted=True)
 
 def main():
     ensure_redis(); cleanup_stale_plugins(); r.flushdb()

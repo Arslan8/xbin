@@ -38,11 +38,12 @@ class TaskContext:
     raw_bytes: bytes
 
 class Worker:
-    def __init__(self, name: str, category: str, version: str, is_validator: bool = False):
+    def __init__(self, name: str, category: str, version: str, is_validator: bool = False, is_ranker: bool = False):
         self.name = name
         self.category = category
         self.version = version
         self.is_validator = is_validator
+        self.is_ranker = is_ranker
         self.worker_id = f"{name}-{uuid.uuid4().hex[:8]}"
         
         self.on_binary_handler = None
@@ -52,7 +53,8 @@ class Worker:
         self.redis_host = os.getenv("REDIS_HOST", "localhost")
         self.rest_url = f"http://{self.orchestrator_addr.split(':')[0]}:8000"
         
-        print(f"[*] Initializing Worker: {self.name} ({self.category}) {'[VALIDATOR]' if is_validator else ''}")
+        type_str = "[VALIDATOR]" if is_validator else "[RANKER]" if is_ranker else ""
+        print(f"[*] Initializing Worker: {self.name} ({self.category}) {type_str}")
         
         try:
             self._channel = grpc.insecure_channel(self.orchestrator_addr)
@@ -90,7 +92,8 @@ class Worker:
         try:
             resp = self._stub.RegisterWorker(orchestrator_pb2.RegisterRequest(
                 worker_id=self.worker_id, backend_name=self.name, 
-                analysis_type=self.category, is_validator=self.is_validator
+                analysis_type=self.category, is_validator=self.is_validator,
+                is_ranker=self.is_ranker
             ))
             if resp.success:
                 print(f"[+] READY: Registered with ID {self.worker_id}")
@@ -121,6 +124,18 @@ class Worker:
             print(f"[V] Validation posted for {item_key} -> {target_id} (Conf: {confidence})")
         except Exception as e:
             print(f"[ERROR] Validation failed for {item_key}: {e}")
+
+    def update_rank(self, item_key: str, target_id: str, new_score: float):
+        """Specifically for Rankers: Update the score of a hypothesis."""
+        try:
+            self._stub.UpdateRank(orchestrator_pb2.UpdateRankRequest(
+                analysis_type=self.category, item_key=item_key,
+                target_hypothesis_id=target_id, new_score=new_score,
+                backend_name=self.name
+            ))
+            print(f"[R] Rank updated for {item_key} (ID: {target_id}) -> {new_score}")
+        except Exception as e:
+            print(f"[ERROR] Rank update failed for {item_key}: {e}")
 
     def get_analysis(self, category: str, item_key: Optional[str] = None):
         url = f"{self.rest_url}/api/v1/blackboard/{category}"
@@ -163,9 +178,9 @@ class Worker:
 
 _current_worker: Optional[Worker] = None
 
-def plugin(name: str, category: str, version: str = "1.0", is_validator: bool = False):
+def plugin(name: str, category: str, version: str = "1.0", is_validator: bool = False, is_ranker: bool = False):
     global _current_worker
-    _current_worker = Worker(name, category, version, is_validator)
+    _current_worker = Worker(name, category, version, is_validator, is_ranker)
     def decorator(cls):
         try:
             instance = cls()
