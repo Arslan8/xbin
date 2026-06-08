@@ -9,13 +9,15 @@ Instead of a monolithic analyzer, **xbin** uses a **Blackboard Architecture**. M
 Traditional binary analysis tools are often isolated silos. **xbin** changes this by fostering an ecosystem where:
 - **Tools Compete**: Multiple backends can solve the same problem (e.g., CFG generation). The blackboard uses weighted confidence to determine the "truth."
 - **Tools Collaborate**: A symbol matcher can wait for a CFG generator to finish and then use that graph as context for better matching.
+- **Tools Validate**: Specialized plugins can sanity-check or "vouch" for the findings of other tools, preventing "hallucinations" or analysis errors from dominating the consensus.
 - **Agentic Ready**: Designed for human-in-the-loop or AI-agent arbitration when tools disagree (Conflict Resolution).
 - **Reactive**: The system is entirely event-driven via Redis Pub/Sub. When a binary is uploaded, the fleet reacts instantly.
 
 ## 🚀 Features
 
 - **Multi-Analysis Support**: Separate blackboards for `symbol_matching`, `cfg_generation`, `decompilation`, and more.
-- **Consensus Visualizer**: Interactive Cytoscape.js graphs that show "vouches" (which tools agreed on which node/edge).
+- **Analysis vs. Validation**: Supports both data producers (analyzers) and data verifiers (validators).
+- **Consensus Visualizer**: Interactive Cytoscape.js graphs that show "vouches" (which tools agreed on which node/edge) and checkmarks for verified results.
 - **Reactive SDK**: A class-based Python SDK that abstracts away all gRPC/Docker boilerplate.
 - **Dynamic Orchestration**: The orchestrator manages its own Redis and sibling plugin containers.
 - **Health Monitoring**: Real-time heartbeats and visual "pulse" animations on the dashboard.
@@ -45,31 +47,31 @@ pip install .
 
 The `xbin` SDK makes it trivial to wrap any analysis script into a containerized worker.
 
-### 1. Write the Worker
+### 1. Write the Worker (Analyzer or Validator)
 Create a Python file using the `@xbin.plugin` decorator:
 
+#### As an Analyzer (Producer)
 ```python
 import xbin
 
-@xbin.plugin(name="my_custom_tool", category="symbol_matching")
-class MyWorker:
-    def on_new_binary(self, binary_path):
-        # 1. Logic: Open file and analyze
-        # 2. Result: Post to blackboard
+@xbin.plugin(name="my_analyzer", category="symbol_matching")
+class MyAnalyzer:
+    def on_new_binary(self, binary_path, requested_goals):
         from xbin.sdk import _current_worker
-        _current_worker.post_result(
-            item_key="0x401000", 
-            data="my_guessed_symbol", 
-            confidence=0.95
-        )
+        _current_worker.post_result(item_key="0x401000", data="main", confidence=0.9)
+```
 
-    def on_update(self, category, item_key, top_hypothesis):
-        # Optional: React when other tools post results
-        if category == "cfg_generation" and top_hypothesis['score'] > 0.8:
-            print(f"I see a high-conf CFG for {item_key}, let me use it!")
+#### As a Validator (Verifier)
+```python
+import xbin
 
-if __name__ == "__main__":
-    xbin.start_worker()
+@xbin.plugin(name="my_validator", category="symbol_matching", is_validator=True)
+class MyValidator:
+    def on_update(self, category, item_key, new_hypothesis, top_hypothesis):
+        if top_hypothesis['data'] == "main":
+            from xbin.sdk import _current_worker
+            # Vouch for the top hypothesis instead of posting new data
+            _current_worker.post_validation(item_key=item_key, target_id="TOP")
 ```
 
 ### 2. Containerize It
