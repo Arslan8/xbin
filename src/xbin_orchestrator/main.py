@@ -7,6 +7,7 @@ import subprocess
 import shutil
 import hashlib
 import sys
+import tempfile
 import webbrowser
 import socket
 import argparse
@@ -34,7 +35,9 @@ except (ImportError, ValueError):
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 GRPC_PORT = "[::]:50051"
 REST_PORT = 8000
-PLUGINS_DIR = os.getenv("XBIN_PLUGINS_DIR", "plugins")
+DEFAULT_PLUGINS_DIR = os.getenv("XBIN_PLUGINS_DIR", "plugins")
+PLUGIN_DIRS = [DEFAULT_PLUGINS_DIR]
+EXPLICIT_PLUGINS = []
 UPLOAD_DIR = "uploads"
 
 BACKEND_WEIGHTS = {
@@ -57,10 +60,10 @@ def sys_log(msg):
     r.lpush("xbin:syslogs", entry)
     r.ltrim("xbin:syslogs", 0, 100)
 
-def set_plugin_state(name, status, error=None):
+def set_plugin_state(name, category, status, error=None):
     state = {"status": status, "last_update": time.time()}
     if error: state["error"] = error
-    r.set(f"xbin:plugin_state:{name}", json.dumps(state))
+    r.set(f"xbin:plugin_state:{category}:{name}", json.dumps(state))
 
 def ensure_redis():
     try:
@@ -87,6 +90,15 @@ def cleanup_stale_plugins():
         r.delete("xbin:active_workers")
         r.delete("xbin:worker_health")
         r.delete("xbin:syslogs")
+        
+        # Reset building states
+        keys = r.keys("xbin:plugin_state:*")
+        for k in keys:
+            state = json.loads(r.get(k))
+            if state.get("status") in ["BUILDING", "STARTING"]:
+                parts = k.split(":")
+                if len(parts) >= 4:
+                    set_plugin_state(parts[3], parts[2], "STOPPED")
     except: pass
 
 # ==========================================
@@ -143,7 +155,6 @@ def get_plugin_logs(name: str, category: str):
 
 @app.get("/api/v1/plugins/available")
 def list_available_plugins():
-    if not os.path.exists(PLUGINS_DIR): return {"plugins": []}
     cmd = ["docker", "ps", "-a", "--filter", "name=xbin-worker-", "--format", "{{.Names}}|{{.Status}}|{{.State}}"]
     res = subprocess.run(cmd, capture_output=True, text=True)
     docker_data = {}
@@ -153,62 +164,162 @@ def list_available_plugins():
     available = []
     health_data = r.hgetall("xbin:worker_health")
     now = time.time()
-    for root, dirs, files in os.walk(PLUGINS_DIR):
-        if "Dockerfile" in files:
-            name = os.path.basename(root); category = os.path.basename(os.path.dirname(root))
-            unique_id = f"{category}-{name}"
-            state_str = r.get(f"xbin:plugin_state:{name}")
-            saved = json.loads(state_str) if state_str else {"status": "STOPPED"}
-            status = saved["status"]
-            
-            # Static discovery: Check if is_validator/is_ranker=True in source files
-            is_validator = saved.get("is_validator", False)
-            is_ranker = saved.get("is_ranker", False)
-            if not is_validator or not is_ranker:
-                for f in files:
-                    if f.endswith(".py"):
-                        try:
-                            with open(os.path.join(root, f), "r") as pf:
-                                content = pf.read()
-                                if "is_validator=True" in content: is_validator = True
-                                if "is_ranker=True" in content: is_ranker = True
-                                if is_validator and is_ranker: break
-                        except: pass
-
-            if unique_id in docker_data:
-                d = docker_data[unique_id]
-                status = "RUNNING" if d["state"] == "running" else "CRASHED" if "Exited (0)" not in d["status"] else "STOPPED"
-            health_status = "UNKNOWN"; last_beat = 0
-            for w_id, w_val in health_data.items():
-                w_data = json.loads(w_val)
-                if w_data.get("backend") == name:
-                    last_beat = w_data["last_heartbeat"]; health_status = "HEALTHY" if (now - last_beat) < 10 else "DEAD"
-                    # Registration-time status takes precedence if active
-                    if "is_validator" in w_data: is_validator = w_data["is_validator"]
-                    if "is_ranker" in w_data: is_ranker = w_data["is_ranker"]
-            available.append({"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error"), "is_validator": is_validator, "is_ranker": is_ranker})
     
+    # 1. Discover plugins in PLUGIN_DIRS
+    for pdir in PLUGIN_DIRS:
+        if not os.path.exists(pdir): continue
+        for root, dirs, files in os.walk(pdir):
+            if "Dockerfile" in files:
+                name = os.path.basename(root)
+                category = os.path.basename(os.path.dirname(root))
+                available.append(_get_plugin_info(root, name, category, docker_data, health_data, now))
+
+    # 2. Add EXPLICIT_PLUGINS
+    for path, category in EXPLICIT_PLUGINS:
+        if not os.path.exists(path): continue
+        name = os.path.basename(path)
+        if os.path.isdir(path):
+            if "Dockerfile" in os.listdir(path):
+                available.append(_get_plugin_info(path, name, category, docker_data, health_data, now))
+        elif path.endswith(".py"):
+            # For .py files, we still require a Dockerfile in the same directory if they are to be built
+            if "Dockerfile" in os.listdir(os.path.dirname(path)):
+                available.append(_get_plugin_info(os.path.dirname(path), name.replace(".py", ""), category, docker_data, health_data, now))
+
+    # De-duplicate by unique_id (category-name)
+    seen = set()
+    unique_available = []
+    for p in available:
+        uid = f"{p['category']}-{p['name']}"
+        if uid not in seen:
+            unique_available.append(p)
+            seen.add(uid)
+
     # Map each category to its active ranker name (if any is registered)
-    categories = list(set([p["category"] for p in available] + ["symbol_matching", "cfg_generation", "function_boundary"]))
+    categories = list(set([p["category"] for p in unique_available] + ["symbol_matching", "cfg_generation", "function_boundary"]))
     ranker_map = {}
     for cat in categories:
-        ranker_map[cat] = next((p["name"] for p in available if p["category"] == cat and p["is_ranker"]), "Baseline")
+        ranker_map[cat] = next((p["name"] for p in unique_available if p["category"] == cat and p["is_ranker"]), "Baseline")
     
-    return {"plugins": available, "rankers": ranker_map}
+    return {"plugins": unique_available, "rankers": ranker_map}
+
+def _get_plugin_info(root, name, category, docker_data, health_data, now):
+    unique_id = f"{category}-{name}"
+    
+    # Try to find the category in the source code first
+    files = os.listdir(root)
+    for f in files:
+        if f.endswith(".py"):
+            try:
+                with open(os.path.join(root, f), "r") as pf:
+                    content = pf.read()
+                    import re
+                    # Look for category="something" or category='something'
+                    cat_match = re.search(r'category=["\']([^"\']+)["\']', content)
+                    if cat_match:
+                        category = cat_match.group(1)
+                        break
+            except: pass
+
+    state_str = r.get(f"xbin:plugin_state:{category}:{name}")
+    saved = json.loads(state_str) if state_str else {"status": "STOPPED"}
+    status = saved["status"]
+    
+    # Static discovery: Check if is_validator/is_ranker=True
+    is_validator = saved.get("is_validator", False)
+    is_ranker = saved.get("is_ranker", False)
+    if not is_validator or not is_ranker:
+        for f in files:
+            if f.endswith(".py"):
+                try:
+                    with open(os.path.join(root, f), "r") as pf:
+                        content = pf.read()
+                        if "is_validator=True" in content: is_validator = True
+                        if "is_ranker=True" in content: is_ranker = True
+                        if is_validator and is_ranker: break
+                except: pass
+
+    if unique_id in docker_data:
+        d = docker_data[unique_id]
+        status = "RUNNING" if d["state"] == "running" else "CRASHED" if "Exited (0)" not in d["status"] else "STOPPED"
+    
+    health_status = "UNKNOWN"; last_beat = 0
+    for w_id, w_val in health_data.items():
+        w_data = json.loads(w_val)
+        if w_data.get("backend") == name:
+            last_beat = w_data["last_heartbeat"]; health_status = "HEALTHY" if (now - last_beat) < 10 else "DEAD"
+            if "is_validator" in w_data: is_validator = w_data["is_validator"]
+            if "is_ranker" in w_data: is_ranker = w_data["is_ranker"]
+            
+    return {"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error"), "is_validator": is_validator, "is_ranker": is_ranker}
+
+def get_plugin_path_and_context(name: str, category: str):
+    # 1. Check EXPLICIT_PLUGINS first
+    for path, p_category in EXPLICIT_PLUGINS:
+        if p_category == category and os.path.basename(path).replace(".py", "") == name:
+            if os.path.isdir(path):
+                return path, path
+            else:
+                return os.path.dirname(path), os.path.dirname(path)
+
+    # 2. Default in-tree plugins build from the repository root (.)
+    default_path = os.path.join(DEFAULT_PLUGINS_DIR, category, name)
+    if os.path.exists(default_path):
+        return default_path, "."
+        
+    # 3. Out-of-tree plugins in PLUGIN_DIRS
+    for pdir in PLUGIN_DIRS:
+        if pdir == DEFAULT_PLUGINS_DIR: continue
+        epath = os.path.join(pdir, category, name)
+        if os.path.exists(epath):
+            return epath, epath
+        # Also check standalone in pdir
+        spath = os.path.join(pdir, name)
+        if category == "standalone" and os.path.exists(spath):
+            return spath, spath
+            
+    raise Exception(f"Plugin {category}/{name} not found in any PLUGIN_DIRS or EXPLICIT_PLUGINS")
 
 def bg_start_plugin(name: str, category: str):
     container_name = get_container_name(name, category)
     image_name = f"xbin-plugin-{category}-{name}"
     try:
-        set_plugin_state(name, "BUILDING")
-        subprocess.run(["docker", "build", "-t", image_name, "-f", os.path.join(PLUGINS_DIR, category, name, "Dockerfile"), "."], check=True, stdout=subprocess.DEVNULL)
-        set_plugin_state(name, "STARTING")
+        p_path, p_context = get_plugin_path_and_context(name, category)
+        
+        set_plugin_state(name, category, "BUILDING")
+        
+        # For out-of-tree plugins, we inject the xbin SDK into the build context
+        if p_context != ".":
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                sys_log(f"Building out-of-tree plugin {name} in {tmp_dir}")
+                # Copy everything from the plugin context into the temp dir
+                shutil.copytree(p_context, tmp_dir, dirs_exist_ok=True)
+                
+                # Inject the SDK from the current xbin project
+                sdk_src = os.path.abspath("src")
+                if os.path.exists(sdk_src):
+                    shutil.copytree(sdk_src, os.path.join(tmp_dir, "src"), dirs_exist_ok=True)
+                for f in ["pyproject.toml", "README.md"]:
+                    if os.path.exists(f):
+                        shutil.copy(f, tmp_dir)
+                
+                # Build from the temp directory
+                dockerfile_path = os.path.join(tmp_dir, "Dockerfile")
+                if not os.path.exists(dockerfile_path):
+                    raise Exception(f"Dockerfile not found in {p_context}")
+                
+                subprocess.run(["docker", "build", "--no-cache", "-t", image_name, "-f", dockerfile_path, tmp_dir], check=True, stdout=subprocess.DEVNULL)
+        else:
+            # In-tree build from root
+            subprocess.run(["docker", "build", "-t", image_name, "-f", os.path.join(p_path, "Dockerfile"), "."], check=True, stdout=subprocess.DEVNULL)
+        
+        set_plugin_state(name, category, "STARTING")
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         abs_uploads = os.path.abspath(UPLOAD_DIR)
         run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1", image_name]
         subprocess.run(run_cmd, check=True, stdout=subprocess.DEVNULL)
     except Exception as e:
-        sys_log(f"Fail {name}: {e}"); set_plugin_state(name, "ERROR", error=str(e))
+        sys_log(f"Fail {name}: {e}"); set_plugin_state(name, category, "ERROR", error=str(e))
 
 @app.post("/api/v1/plugins/{name}/start")
 def start_plugin(name: str, category: str, background_tasks: BackgroundTasks):
@@ -219,7 +330,7 @@ def start_plugin(name: str, category: str, background_tasks: BackgroundTasks):
 def stop_plugin(name: str, category: str):
     container_name = get_container_name(name, category)
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
-    set_plugin_state(name, "STOPPED")
+    set_plugin_state(name, category, "STOPPED")
     return {"status": "success"}
 
 @app.post("/api/v1/shutdown")
@@ -562,7 +673,7 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         }))
         
         # Persist type status in long-term plugin state
-        state_key = f"xbin:plugin_state:{request.backend_name}"
+        state_key = f"xbin:plugin_state:{request.analysis_type}:{request.backend_name}"
         state = json.loads(r.get(state_key)) if r.exists(state_key) else {"status": "RUNNING"}
         state["is_validator"] = request.is_validator
         state["is_ranker"] = request.is_ranker
@@ -696,8 +807,22 @@ def is_port_in_use(port):
 def main():
     parser = argparse.ArgumentParser(description="xbin Orchestrator")
     parser.add_argument("--no-browser", action="store_true", help="Do not automatically open the dashboard in a browser.")
+    parser.add_argument("--plugin-dir", action="append", default=[], help="Path to an external directory containing custom plugins (can be used multiple times).")
+    parser.add_argument("--plugin", action="append", default=[], help="Path to an individual plugin file (.py) or directory (containing a Dockerfile).")
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
+    
+    global PLUGIN_DIRS, EXPLICIT_PLUGINS
+    for pd in args.plugin_dir:
+        PLUGIN_DIRS.append(os.path.abspath(pd))
+    for p in args.plugin:
+        if ":" in p:
+            path, category = p.rsplit(":", 1)
+        else:
+            path = p
+            # Infer category from parent directory if not provided
+            category = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        EXPLICIT_PLUGINS.append((os.path.abspath(path), category))
 
     ensure_redis(); cleanup_stale_plugins(); r.flushdb()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))

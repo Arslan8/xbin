@@ -202,3 +202,28 @@ def start_worker():
             traceback.print_exc()
     else:
         print("[ERROR] No plugin defined. Use @xbin.plugin.")
+
+def post_result(item_key: str, data: Any, confidence: float):
+    if _current_worker:
+        _current_worker.post_result(item_key, data, confidence)
+    else:
+        print("[ERROR] No active worker. Call @xbin.plugin first.")
+
+def post_validation(item_key: str, target_id: str = "TOP", confidence: float = 1.0):
+    if _current_worker:
+        _current_worker.post_validation(item_key, target_id, confidence)
+    else:
+        print("[ERROR] No active worker. Call @xbin.plugin first.")
+
+def update_rank(item_key: str, target_id: str, new_score: float):
+    if _current_worker:
+        _current_worker.update_rank(item_key, target_id, new_score)
+    else:
+        print("[ERROR] No active worker. Call @xbin.plugin first.")
+
+def get_analysis(category: str, item_key: Optional[str] = None):
+    if _current_worker:
+        return _current_worker.get_analysis(category, item_key)
+    else:
+        print("[ERROR] No active worker. Call @xbin.plugin first.")
+        return None

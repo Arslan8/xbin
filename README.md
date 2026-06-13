@@ -76,6 +76,23 @@ CMD ["python", "my_worker.py"]
 ### 3. Register
 Drop your folder into `plugins/<category>/`. The orchestrator will automatically find it and show a **Start** button on the dashboard.
 
+## 📦 Out-of-Tree Plugins
+
+You don't have to keep your plugins inside the `xbin` repository. You can develop them in their own standalone repositories and point the orchestrator to them:
+
+```bash
+# Load a standalone plugin folder
+xbin-orchestrator --plugin /path/to/my_standalone_tool
+
+# Load a collection of plugins from an external directory
+xbin-orchestrator --plugin-dir /path/to/my_plugin_repo
+```
+
+When running out-of-tree:
+- **Category Inference**: The orchestrator scans your code for `@xbin.plugin(category="...")`.
+- **SDK Injection**: \`xbin\` automatically injects the SDK into the build context—no need to manually copy files.
+- **Explicit Docker**: You must provide a \`Dockerfile\` in your plugin directory for dependency management.
+
 ## 🧪 Testing
 
 The project includes an automated integration test suite using `pytest`. The tests verify the core Blackboard logic, including Analyzer submissions, Validator vouching, and Ranker overrides.

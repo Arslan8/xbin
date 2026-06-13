@@ -55,7 +55,6 @@ This tool searches for a specific string and posts a symbol hypothesis.
 
 ```python
 import xbin
-from xbin.sdk import _current_worker
 
 @xbin.plugin(name="hello_finder", category="symbol_matching")
 class HelloFinder:
@@ -67,7 +66,7 @@ class HelloFinder:
             data = f.read()
             if b"Hello, World!" in data:
                 # We found it! Post the result to the blackboard
-                _current_worker.post_result(
+                xbin.post_result(
                     item_key="0x401000", 
                     data="main_entry_greeting", 
                     confidence=0.8
@@ -82,14 +81,13 @@ This tool listens for the `hello_finder`'s output and vouches for it if it meets
 
 ```python
 import xbin
-from xbin.sdk import _current_worker
 
 @xbin.plugin(name="hello_validator", category="symbol_matching", is_validator=True)
 class HelloValidator:
     def on_update(self, category, item_key, new_hypothesis, top_hypothesis):
         # If the new finding is our target string, vouch for it!
         if category == "symbol_matching" and new_hypothesis['data'] == "main_entry_greeting":
-            _current_worker.post_validation(item_key=item_key, target_id="TOP")
+            xbin.post_validation(item_key=item_key, target_id="TOP")
 
 if __name__ == "__main__":
     xbin.start_worker()
@@ -100,7 +98,6 @@ Rankers listen to both analysis and validation events and apply global ranking h
 
 ```python
 import xbin
-from xbin.sdk import _current_worker
 
 @xbin.plugin(name="hello_ranker", category="symbol_matching", is_ranker=True)
 class HelloRanker:
@@ -112,7 +109,7 @@ class HelloRanker:
         # Heuristic: If we have any validators, boost the score to a high fixed value
         v_count = len(top_hypothesis.get('validators', []))
         if v_count >= 1:
-            _current_worker.update_rank(item_key, top_hypothesis['id'], 2.0)
+            xbin.update_rank(item_key, top_hypothesis['id'], 2.0)
 
 if __name__ == "__main__":
     xbin.start_worker()
@@ -130,26 +127,32 @@ Registers your class with the orchestrator.
 - `is_ranker` (bool): Set to `True` for tools that judge and re-rank hypotheses.
 
 ### Callbacks (Implemented in your class)
-...
+
+#### `on_new_binary(self, binary_path, requested_goals)`
+Called when a new binary is uploaded. `binary_path` is the path inside the container.
+
 #### `on_update(self, category, item_key, new_hypothesis, top_hypothesis)`
 Called every time the blackboard changes. Use this to build collaborative tools, Validators, or Rankers.
-...
-### Methods (via `xbin.sdk._current_worker`)
-#### `post_result(item_key, data, confidence)`
+
+### Methods (via `xbin` module)
+
+#### `xbin.post_result(item_key, data, confidence)`
 Submit a new finding. If the data is unique, it creates a new hypothesis. If it matches an existing one, it acts as a vouch.
 - `item_key`: Unique subject identifier.
 - `data`: Any JSON-serializable object.
 - `confidence`: Your certainty (0.0 to 1.0).
 
-#### `post_validation(item_key, target_id="TOP", confidence=1.0)`
+#### `xbin.post_validation(item_key, target_id="TOP", confidence=1.0)`
 Specifically for validators. Boosts the score of an existing hypothesis.
 - `target_id`: The ID of the hypothesis to vouch for, or `"TOP"` for the leader.
 
-#### `update_rank(item_key, target_id, new_score)`
+#### `xbin.update_rank(item_key, target_id, new_score)`
 Specifically for Rankers. Updates the absolute consensus score of a hypothesis.
 - `item_key`: The subject identifier.
 - `target_id`: The unique hash ID of the hypothesis.
 - `new_score`: The new float score.
 
-#### `get_analysis(category, item_key=None)`
-...
+#### `xbin.get_analysis(category, item_key=None)`
+Fetch current results from the blackboard.
+- `category`: The blackboard category to query.
+- `item_key`: Optional. Filter for a specific item.
